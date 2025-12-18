@@ -1,0 +1,14 @@
+# 忽略数据文件
+*.h5ad
+*.gz
+*.gtf
+*.csv
+
+# 忽略缓存和环境文件
+__pycache__/
+.ipynb_checkpoints/
+bin/
+
+# 忽略临时脚本
+Untitled.ipynb
+*.gz.*
