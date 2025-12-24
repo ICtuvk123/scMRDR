@@ -413,7 +413,8 @@ class EmbeddingNet(nn.Module):
                 else:
                     z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,w],dim=-1))
                     z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,w],dim=-1))
-
+            
+            # concat z_shared adn z_specific to predict q(x|z)
             z = torch.cat([z_shared,z_specific],dim=-1)
             if self.count_data:
                 rho,dispersion,pi = self.decoder(z, b, m)
