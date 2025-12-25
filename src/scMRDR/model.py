@@ -9,6 +9,50 @@ import scipy as sp
 import ot
 from einops import rearrange
 
+import copy
+from torch import einsum
+from pathlib import Path
+import math
+from tqdm import tqdm
+from torch.optim import Adam
+from torch.utils import data
+import scanpy as sc
+from einops import rearrange, repeat
+from .utils import make_beta_schedule, default, exists, extract_into_tensor, BatchedOperation, noise_like
+from .utils import create_activation, create_norm, mean_flat, sum_flat, gaussian_parameters
+from .utils import timestep_embedding
+from typing import Optional
+from functools import partial
+try:
+    from apex import amp
+    APEX_AVAILABLE = True
+except:
+    APEX_AVAILABLE = False
+import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+import logging
+import random
+from .Dataset import Dataset
+
+def get_logger(filename, verbosity=1, name=None):
+    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(filename)s][line:%(lineno)d][%(levelname)s] %(message)s"
+    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level_dict[verbosity])
+
+    fh = logging.FileHandler(filename, "w")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    return logger
+
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
@@ -262,7 +306,7 @@ class DisentanglementEncoder(nn.Module):
 
 class Encoder(nn.Module):
     '''
-    # Encoder for the VAE model.
+    # Encoder for the representation learning model.
     # Args:
     #     device (torch.device): Device to run the model on.
     #     input_dim (int): Dimension of the input data.
@@ -318,199 +362,6 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         z = mu + eps * std
         return z
-
-class MSEDecoder(nn.Module):
-    '''
-    MSE Decoder for the VAE model.
-    Args:
-        device (torch.device): Device to run the model on.
-        input_dim (int): Dimension of the input data.
-        covariate_dim (int): Dimension of the batch size.
-        layer_dims (list): List of hidden layer dimensions.
-        latent_dim (int): Dimension of the latent space.
-        dropout_rate (float): Dropout rate for regularization.
-    '''
-    def __init__(self, device, input_dim = 3000, covariate_dim = 1, layer_dims = [500,100], latent_dim = 20,
-                 dropout_rate = 0.5, positive_outputs=True):
-        super(MSEDecoder, self).__init__()
-        
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.covariate_dim = covariate_dim
-        
-        # p(x|z,c)
-        layers_xz = []
-        current_dim =  latent_dim + covariate_dim
-        for dim in reversed(layer_dims):
-            layers_xz.append(nn.Linear(current_dim, dim))
-            layers_xz.append(nn.LeakyReLU(0.1))
-            layers_xz.append(nn.BatchNorm1d(dim))
-            layers_xz.append(nn.Dropout(dropout_rate))
-            current_dim = dim
-        
-        self.decoder = nn.Sequential(*layers_xz)   
-        if positive_outputs: 
-            self.mean_layer = nn.Sequential(nn.Linear(layer_dims[0], input_dim),
-                                            nn.Softplus())
-            # self.zero_inflation_rates = nn.Parameter(torch.ones(input_dim) * 0.5) 
-        else:
-            self.mean_layer = nn.Sequential(nn.Linear(layer_dims[0], input_dim)
-                                            # nn.Softplus()
-                                            )
-        
-    def forward(self,z,b):
-        '''
-        Forward pass through the decoder.
-        Args:
-            z (torch.Tensor): Latent variable tensor of shape (batch_size, latent_dim).
-            b (torch.Tensor): Batch information tensor of shape (batch_size, covariate_dim).
-        Returns:
-            rho (torch.Tensor): Mean of the output distribution.
-        '''
-        if self.covariate_dim > 0:
-            z = torch.cat([z, b],dim=1)
-        h = self.decoder(z)
-        rho = self.mean_layer(h) 
-        return rho
-
-class Decoder(nn.Module):
-    '''
-    ZINB Decoder for the VAE model.
-    Args:
-        device (torch.device): Device to run the model on.
-        input_dim (int): Dimension of the input data.
-        covariate_dim (int): Dimension of the batch size.
-        modality_num (int): Number of modalities.
-        layer_dims (list): List of hidden layer dimensions.
-        latent_dim (int): Dimension of the latent space.
-        dropout_rate (float): Dropout rate for regularization.
-    '''
-    def __init__(self, device, input_dim = 3000, covariate_dim = 1, modality_num=2, layer_dims = [500,100], latent_dim = 20,
-                 dropout_rate = 0.5):
-        super(Decoder, self).__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.covariate_dim = covariate_dim
-        self.modality_num = modality_num
-        
-        # p(x|z,c)
-        layers_xz = []
-        current_dim =  latent_dim + covariate_dim
-        for dim in reversed(layer_dims):
-            layers_xz.append(nn.Linear(current_dim, dim))
-            layers_xz.append(nn.BatchNorm1d(dim))
-            layers_xz.append(nn.LeakyReLU(0.1))
-            layers_xz.append(nn.Dropout(dropout_rate))
-            current_dim = dim
-        
-        self.decoder = nn.Sequential(*layers_xz)    
-        self.mean_layer = nn.Sequential(nn.Linear(layer_dims[0], input_dim),
-                                        nn.Softmax(dim=-1))
-        self.dispersion_layer = nn.Sequential(nn.Linear(layer_dims[0], input_dim),
-                                              nn.Softplus()) # gene-cell-wise dispersion
-        self.dispersion = nn.Parameter(torch.randn(input_dim)) # gene-wise dispersion
-        # self.modality_flag = nn.Sequential(nn.Linear(modality_num,1),nn.Tanh())
-        self.dispersion_modality = nn.Parameter(torch.randn(modality_num, input_dim)) 
-        self.dropout_layer = nn.Sequential(
-            nn.Linear(layer_dims[0], input_dim),
-            nn.Sigmoid())
-        
-    def forward(self,z,b,m,dispersion_strategy="gene-modality"):
-        '''
-        Forward pass through the decoder.
-        Args:  
-            z (torch.Tensor): Latent variable tensor of shape (batch_size, latent_dim).
-            b (torch.Tensor): Batch information tensor of shape (batch_size, covariate_dim).
-            m (torch.Tensor): Modality information tensor of shape (batch_size, modality_num).
-        Returns:
-            rho (torch.Tensor): Mean of the output distribution.
-            dispersion (torch.Tensor): Dispersion parameter of the output distribution.
-            pi (torch.Tensor): Dropout probabilities for the output distribution.
-        '''
-        if self.covariate_dim > 0:
-            z = torch.cat([z, b],dim=1)
-        h = self.decoder(z)
-        rho = self.mean_layer(h)  # Ensure positive outputs
-        if dispersion_strategy == "gene":
-            dispersion = torch.exp(self.dispersion)
-        elif dispersion_strategy == "gene-modality":
-            # dispersion = torch.outer(torch.squeeze(self.modality_flag(m)), self.dispersion) # N * G
-            dispersion = m @ self.dispersion_modality    # N * G
-            dispersion = torch.exp(dispersion) # Ensure positive outputs # gene-wise
-        elif dispersion_strategy == "gene-cell":
-            dispersion = self.dispersion_layer(h) # gene-cell wise
-        pi = self.dropout_layer(h) 
-        return rho, dispersion, pi
-
-
-class NBDecoder(nn.Module):
-    '''
-    NB Decoder for the VAE model.
-    Args:
-        device (torch.device): Device to run the model on.
-        input_dim (int): Dimension of the input data.
-        covariate_dim (int): Dimension of the batch size.
-        modality_num (int): Number of modalities.
-        layer_dims (list): List of hidden layer dimensions.
-        latent_dim (int): Dimension of the latent space.
-        dropout_rate (float): Dropout rate for regularization.
-    '''
-    def __init__(self, device, input_dim = 3000, covariate_dim = 1, modality_num=2, layer_dims = [500,100], latent_dim = 20,
-                 dropout_rate = 0.5):
-        super(NBDecoder, self).__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.covariate_dim = covariate_dim
-        self.modality_num = modality_num
-        
-        # p(x|z,c)
-        layers_xz = []
-        current_dim =  latent_dim + covariate_dim
-        for dim in reversed(layer_dims):
-            layers_xz.append(nn.Linear(current_dim, dim))
-            layers_xz.append(nn.BatchNorm1d(dim))
-            layers_xz.append(nn.LeakyReLU(0.1))
-            layers_xz.append(nn.Dropout(dropout_rate))
-            current_dim = dim
-        
-        self.decoder = nn.Sequential(*layers_xz)    
-        self.mean_layer = nn.Sequential(nn.Linear(layer_dims[0], input_dim),
-                                        nn.Softmax(dim=-1))
-        self.dispersion_layer = nn.Sequential(nn.Linear(layer_dims[0], input_dim),
-                                              nn.Softplus()) # gene-cell-wise dispersion
-        self.dispersion = nn.Parameter(torch.randn(input_dim)) # gene-wise dispersion
-        # self.modality_flag = nn.Sequential(nn.Linear(modality_num,1),nn.Tanh())
-        self.dispersion_modality = nn.Parameter(torch.randn(modality_num, input_dim)) 
-        # self.dropout_layer = nn.Sequential(
-        #     nn.Linear(layer_dims[0], input_dim),
-        #     nn.Sigmoid())
-        
-    def forward(self,z,b,m,dispersion_strategy="gene-modality"):
-        '''
-        Forward pass through the decoder.
-        Args:  
-            z (torch.Tensor): Latent variable tensor of shape (batch_size, latent_dim).
-            b (torch.Tensor): Batch information tensor of shape (batch_size, covariate_dim).
-            m (torch.Tensor): Modality information tensor of shape (batch_size, modality_num).
-        Returns:
-            rho (torch.Tensor): Mean of the output distribution.
-            dispersion (torch.Tensor): Dispersion parameter of the output distribution.
-            pi (torch.Tensor): Dropout probabilities for the output distribution.
-        '''
-        if self.covariate_dim > 0:
-            z = torch.cat([z, b],dim=1)
-        h = self.decoder(z)
-        rho = self.mean_layer(h)  # Ensure positive outputs
-        if dispersion_strategy == "gene":
-            dispersion = torch.exp(self.dispersion)
-        elif dispersion_strategy == "gene-modality":
-            # dispersion = torch.outer(torch.squeeze(self.modality_flag(m)), self.dispersion) # N * G
-            dispersion = m @ self.dispersion_modality    # N * G
-            dispersion = torch.exp(dispersion) # Ensure positive outputs # gene-wise
-        elif dispersion_strategy == "gene-cell":
-            dispersion = self.dispersion_layer(h) # gene-cell wise
-        pi = torch.zeros_like(rho)
-        return rho, dispersion, pi
 
 class CrossAttention(nn.Module):
     def __init__(self,
@@ -629,6 +480,7 @@ class Denoise_net(nn.Module):
     def __init__(self, 
                  dim, 
                  out_dim, 
+                 context_dim = None,
                  depth = 4,
                  num_heads = 4, 
                  dim_head = 64,
@@ -669,13 +521,13 @@ class Denoise_net(nn.Module):
         # the embeddings will be given by encoder during the whole training part
 
         self.Cross_attention_module = nn.ModuleList([
-            BasicTransformerBlock(out_dim, num_heads, dim_head, self_attn=False, cross_attn=True, context_dim=32, 
+            BasicTransformerBlock(out_dim, num_heads, dim_head, self_attn=False, cross_attn=True, context_dim=context_dim, 
                                   qkv_bias=True, dropout=dropout, final_act=None)
             for _ in range(depth)
         ])
         self.decoder_norm = create_norm(norm_type, out_dim)
         
-    def forward(self, x, x_start, time, embeddings, labels=None):
+    def forward(self, x, x_start, time, embeddings=None):
         # if self.cond_embed is not None:
         #     cond_emb = self.cond_embed(conditions)[0]
         #     x = x + cond_emb.squeeze(1)
@@ -724,18 +576,20 @@ class Denoise_net(nn.Module):
         #     print("No condition for labels and factor embs all exisits")
         #     return
 
-class GaussianDiffusion(nn.Module):
+class ZINBDiffusion(nn.Module):
     def __init__(self, 
-                 denosie_fn, 
+                 denoise_fn, 
                  *, 
                  profile_size, 
+                 gene_num = None,
                 #  channels = 3, 
                  timesteps = 1000, 
                  loss_type = "l1", 
                  betas = None):
         super().__init__()
         self.profile_size = profile_size
-        self.denosie_fn = denosie_fn
+        self.gene_num = default(gene_num, profile_size)
+        self.denoise_fn = denoise_fn
         
      
         
@@ -807,9 +661,10 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
     
-    def p_mean_variance(self, x, t, clip_denoised: bool):
-        # x_recon = self.predict_start_from_noise(x, t=t, noise=self.denosie_fn(x, t))
-        x_recon = self.denosie_fn(x, t)
+    def p_mean_variance(self, x, t, clip_denoised: bool, embeddings=None):
+        # x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_fn(x, t))
+        # Pass None for x_start to match Denoise_net signature: (x, x_start, time, embeddings)
+        x_recon = self.denoise_fn(x, None, t, embeddings=embeddings)
         # this should be setted as the data distribution
         if clip_denoised:
             x_recon.clamp_(0)
@@ -849,9 +704,9 @@ class GaussianDiffusion(nn.Module):
         
         x_start = None
         if eps:
-            x_recon = self.predict_start_from_noise(x, t=t, noise=self.denosie_fn(x, x_start, t, concept_embs = concept_embs))
+            x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_fn(x, x_start, t, embeddings = concept_embs))
         else:
-            x_recon = self.denosie_fn(x, x_start, t, concept_embs = concept_embs)
+            x_recon = self.denoise_fn(x, x_start, t, embeddings = concept_embs)
             
         # this should be setted as the data distribution
         if clip_denoised:
@@ -910,36 +765,42 @@ class GaussianDiffusion(nn.Module):
         return (extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +  
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
                 )
-            
-    def p_losses(self, x_start, embeddings, t, labels, weights, noise = None, eps = False):
+
+    def p_losses(self, x_start, t, embeddings, weights = 1.0, noise = None, eps = False, **kwargs):
         b, c = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
         
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_recon, mask_recon_loss, pred_o_loss, discriminator_loss, prior_kl = self.denosie_fn(x_noisy, x_start, t, labels)
+        x_recon = self.denoise_fn(x_noisy, x_start, t, embeddings=embeddings)
         
         assert x_recon.shape == x_noisy.shape, "Please check the code and data"
         
         if self.loss_type == "l1":
             if eps:
-                loss = (((noise - x_recon).abs()) * weights[:, None]).sum()
+                loss = (noise - x_recon).abs()
             else:
-                loss = (((x_start - x_recon).abs()) * weights[:, None]).sum()
+                loss = (x_start - x_recon).abs()
         elif self.loss_type == "l2":
+            assert x_recon.shape == x_noisy.shape, "Please check the code and data"
             if eps:
-                loss = (((noise - x_recon)**2) * weights[:, None]).sum()
+                loss = (noise - x_recon)**2
             else:
-                loss = (((x_start - x_recon)**2) * weights[:, None]).sum()
+                loss = (x_start - x_recon)**2
         else:
             raise NotImplementedError()
         
-        return loss, mask_recon_loss, pred_o_loss, discriminator_loss, prior_kl
+        if isinstance(weights, torch.Tensor):
+            loss = (loss * weights[:, None]).sum()
+        else:
+            loss = (loss * weights).sum()
+        
+        return loss
     
-    def forward(self, x, *args, **kwargs):
+    def forward(self, x, embeddings, *args, **kwargs):
         b, c, device, profile_size, = *x.shape, x.device, self.profile_size
         assert c == profile_size, f'dimension of gene expression profile must be {profile_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(x, t, *args, **kwargs)
+        return self.p_losses(x, t, embeddings=embeddings, *args, **kwargs)
 
 
 class EmbeddingNet(nn.Module):
@@ -1001,15 +862,14 @@ class EmbeddingNet(nn.Module):
                                       layer_dims, latent_dim_shared, dropout_rate)
         self.encoder_specific = Encoder(device, input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num, 
                                         layer_dims, latent_dim_specific, dropout_rate)
-        if self.distribution == "ZINB":
-            self.decoder = Decoder(device, input_dim, covariate_dim, modality_num, layer_dims, 
-                                   latent_dim_shared+latent_dim_specific, dropout_rate)
-        elif self.distribution == "NB":
-            self.decoder = Decoder(device, input_dim, covariate_dim, modality_num, layer_dims, 
-                                   latent_dim_shared+latent_dim_specific, dropout_rate)
-        else:
-            self.decoder = MSEDecoder(device, input_dim, covariate_dim, layer_dims, latent_dim_shared+latent_dim_specific, 
-                                      dropout_rate, positive_outputs=self.positive_outputs)
+        
+        # Initialize Diffusion Model
+        X_dim = input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num
+        z_total_dim = latent_dim_shared + latent_dim_specific
+        # Output dim: 3 parameters per gene (rho, disp, pi) + rest of the features
+        denoise_out_dim = X_dim
+        self.Denoise_model = Denoise_net(X_dim, denoise_out_dim, context_dim=z_total_dim, out_act=None)
+        self.diffusion_model = ZINBDiffusion(self.Denoise_model, profile_size=X_dim, gene_num=input_dim, loss_type="l2")
             
         self.prior_net_specific = nn.Sequential(nn.Linear(modality_num + self.celltype_num, 10),
                                     nn.LeakyReLU(0.1),
@@ -1017,7 +877,7 @@ class EmbeddingNet(nn.Module):
                                     nn.Linear(10, 2))
         self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)   
     
-    def forward(self,x,b,m,i,w,stage="vae"):
+    def forward(self,x,b,m,i,w,stage="diffusion"):
         '''
         Forward pass through the embedding network.
         Args:
@@ -1026,15 +886,14 @@ class EmbeddingNet(nn.Module):
             m (torch.Tensor): Modality information tensor of shape (batch_size, modality_num).
             i (torch.Tensor): Mask indicator tensor of shape (batch_size, input_dim).
             w (torch.Tensor): Cell type information tensor of shape (batch_size, celltype_num).
-            stage (str): Stage of the model, can be "vae", "discriminator", or "warmup".
+            stage (str): Stage of the model, can be "diffusion", "discriminator", or "warmup".
         Returns:
             mu_shared (torch.Tensor): Mean of the shared latent variable distribution.
             mu_specific (torch.Tensor): Mean of the specific latent variable distribution.
-            total_loss (torch.Tensor): Total loss for the VAE model.
+            total_loss (torch.Tensor): Total loss for the model.
             loss_dict (dict): Dictionary containing individual loss components.
         '''
-        if stage=="vae":
-            x_original = x
+        if stage=="diffusion":
             if self.count_data:
                 x = torch.log1p(x)
             
@@ -1057,35 +916,15 @@ class EmbeddingNet(nn.Module):
             
             # concat z_shared adn z_specific to predict q(x|z)
             z = torch.cat([z_shared,z_specific],dim=-1)
+            z_context = z.unsqueeze(1)
 
-            X_dim = input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num
-            Denoise_model = Denoise_net(X_dim,X_dim)
-            diffusion_model = GaussianDiffusion(Denoise_model,X_dim,timesteps,loss_type,betas)
-
-            diffusion_model(torch.cat([x,b,w],dim=-1),z,t,labels,weights)
-            if self.count_data:
-                rho,dispersion,pi = self.decoder(z, b, m)
-                s = self.sample_sequencing_depth(x_original)
-            else:
-                rho = self.decoder(z, b)
-    
-            # rho2,dispersion2,pi2 = self.decoder2(z_shared, b, m)
+            diff_inputs = [x, m]
+            if self.encoder_covariates:
+                diff_inputs.append(b)
+            if self.celltype_num > 0:
+                diff_inputs.append(w)
+            diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
             
-            #loss
-            if self.feat_mask is not None:
-                mask = i @ self.feat_mask
-            else:
-                mask = None
-            
-            zinb_loss = ZINBLoss()
-            if self.count_data:
-                recon_loss = zinb_loss(x_original, rho, dispersion, pi, s, mask, eps = self.eps)
-            else:
-                if self.positive_outputs:
-                    # recon_loss = ZeroInflatedMSELoss()(x_original, rho, self.decoder.zero_inflation_rates)
-                    recon_loss = mseLoss(x_original, rho)
-                else:
-                    recon_loss = mseLoss(x_original, rho)
             kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
                 klLoss(mu_shared, logvar_shared)
             # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
@@ -1107,15 +946,14 @@ class EmbeddingNet(nn.Module):
             # discri_loss = F.cross_entropy(modality_logits, modality_labels, reduction='sum')/m.shape[0]
 
                 
-            total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss + self.lambda_adv * adv_loss # + align_loss
+            total_loss = diffusion_loss + self.beta*kl_z + self.gamma * preserve_loss + self.lambda_adv * adv_loss # + align_loss
             loss_dict = {'total_loss':total_loss.item(), 
-                        'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
+                        'diffusion_loss':diffusion_loss.item(),'kl_z':kl_z.item(),
                         'preserve_loss': preserve_loss.item(), #,'align_loss':align_loss.item()
                         'adv_loss': adv_loss.item()
                         } 
             return mu_shared, mu_specific, total_loss, loss_dict
         elif stage=="discriminator":
-            x_original = x
             if self.count_data:
                 x = torch.log1p(x)
             
@@ -1137,7 +975,6 @@ class EmbeddingNet(nn.Module):
             return discri_loss
         
         elif stage=="warmup":
-            x_original = x
             if self.count_data:
                 x = torch.log1p(x)
             
@@ -1149,55 +986,27 @@ class EmbeddingNet(nn.Module):
                 z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
                 z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
             z = torch.cat([z_shared,z_specific],dim=-1)
-            if self.count_data:
-                rho,dispersion,pi = self.decoder(z, b, m)
-                s = self.sample_sequencing_depth(x_original)
-            else:
-                rho = self.decoder(z, b)
+            z_context = z.unsqueeze(1)
+            
+            diff_inputs = [x, m]
+            if self.encoder_covariates:
+                diff_inputs.append(b)
+            if self.celltype_num > 0:
+                diff_inputs.append(w)
+            diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
             
             # loss
-            if self.feat_mask is not None:
-                mask = m @ self.feat_mask
-            else:
-                mask = None
-            
-            zinb_loss = ZINBLoss()
-            if self.count_data:
-                recon_loss = zinb_loss(x_original, rho, dispersion, pi, s, mask, eps = self.eps)
-            else:
-                recon_loss = mseLoss(x_original, rho, mask)
             kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
                 klLoss(mu_shared, logvar_shared)
             preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)  
             # hsic = 1000 * HSICloss(z_shared,m)
-            total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss #+ hsic
-            loss_dict = {'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
+            total_loss = diffusion_loss + self.beta*kl_z + self.gamma * preserve_loss #+ hsic
+            loss_dict = {'diffusion_loss':diffusion_loss.item(),'kl_z':kl_z.item(),
                         'preserve_loss': preserve_loss.item(),
                         # 'hsic': hsic.item(),
                         'total_loss':total_loss.item()
                         } 
             return mu_shared, mu_specific, total_loss, loss_dict
-    
-    def sample_sequencing_depth(self, x, strategy="observed"):
-        '''
-        Sample sequencing depth based on the strategy.
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, input_dim).
-            strategy (str): Strategy for sampling sequencing depth, can be "batch_sample" or "observed".
-        Returns:
-            s (torch.Tensor): Sampled sequencing depth tensor of shape (batch_size, 1).
-        '''
-        if strategy=="batch_sample": # batch-wise empirically sample
-            mu_s = torch.log(x.sum(dim=1) + 1.0).mean()
-            sigma_s = torch.log(x.sum(dim=1) + 1.0).std()
-            log_s = mu_s + sigma_s * torch.randn_like(sigma_s)
-            s = torch.exp(log_s)
-            # s = s.detach()
-        elif strategy == "observed": # directly observed
-            log_s = torch.log(x.sum(dim=1)).unsqueeze(1)
-            s = torch.exp(log_s)
-            # s = s.detach()
-        return s
     
     def reparameterize(self, mu, logvar):
         '''
