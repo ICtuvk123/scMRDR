@@ -12,21 +12,23 @@ class EarlyStopping:
         delta: float, delta for early stopping
         verbose: bool, whether to print early stopping information
     '''
-    def __init__(self, patience=10, delta=0.0, verbose=False):
+    def __init__(self, patience=10, delta=0.0, verbose=False, path='checkpoint.pt'):
         super().__init__()
         self.patience = patience
         self.delta = delta
         self.verbose = verbose
+        self.path = path
         self.counter = 0
         self.best_score = None
         self.early_stop = False
+        self.val_loss_min = np.Inf
 
     def __call__(self, val_loss, model):
         score = -val_loss
 
         if self.best_score is None:
             self.best_score = score
-            # self.save_checkpoint(model)
+            self.save_checkpoint(val_loss, model)
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.verbose:
@@ -35,14 +37,14 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.best_score = score
-            # self.save_checkpoint(model)
+            self.save_checkpoint(val_loss, model)
             self.counter = 0
 
-    # def save_checkpoint(self, model, path="best_model.pt"):
-    #     self.path = path
-        # torch.save(model.state_dict(), self.path)
-        # if self.verbose:
-        #     print(f"Validation loss decreased, model saved to {self.path}")
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        torch.save(model.state_dict(), self.path)
+        self.val_loss_min = val_loss
 
 def train_model(device, writer, train_dataset, validate_dataset, model, epoch_num, batch_size, 
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
@@ -208,6 +210,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 early_stopping(validate_loss, model)
                 if early_stopping.early_stop:
                     print(f"Early stopping at epoch {epoch+1}")
+                    model.load_state_dict(torch.load(early_stopping.path))
                     break
 
 def validate_model(device, validate_dataset, model, batch_size):
