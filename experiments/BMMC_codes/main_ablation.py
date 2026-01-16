@@ -17,8 +17,9 @@ import scanpy as sc
 # from module import Integration
 
 import sys
-sys.path.insert(1, '/home/bingxing2/ailab/scxlab0179/integration/models2')
-from module import Integration
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from scMRDR.module import Integration
 
 # adata = sc.read_h5ad("/ailab/user/sunjianle-hdd/integration27/BMMC/data2/feature_aligned_unpaired.h5ad")
 # atac = sc.read("/ailab/user/sunjianle-hdd/integration27/BMMC/data2/ATAC_counts_qc_slt.h5ad")

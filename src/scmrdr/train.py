@@ -78,15 +78,15 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
     else:   
         train_data = DataLoader(train_dataset,batch_size,shuffle=True,drop_last=True,num_workers=4,pin_memory=True)
     # optimizer = optim.Adam(model.parameters(), lr=lr)
-    optimizer_vae = torch.optim.Adam(list(model.encoder_shared.parameters()) + 
+    optimizer_gen = torch.optim.Adam(list(model.encoder_shared.parameters()) + 
                                      list(model.encoder_specific.parameters()) + 
-                                     list(model.decoder.parameters()) +
-                                     list(model.prior_net_specific.parameters()), lr=lr)
-    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
+                                     list(model.decoder.parameters()), lr=lr)
+    # FIX: Reduce Discriminator learning rate to prevent it from overpowering the Generator
+    optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr * 0.1)
     if adaptlr==True:
         scheduler_d =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer = optimizer_d,
                                                             T_max =  epoch_num * num_batch)
-        scheduler_vae =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer = optimizer_vae,
+        scheduler_gen =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer = optimizer_gen,
                                                             T_max =  epoch_num * num_batch)
     
     if early_stopping:
@@ -94,8 +94,8 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
 
     for epoch in range(epoch_num):
         model.train()
-        total_loss,recon_loss,kl_z,preserve_loss,adv_loss,total_discri_loss = \
-            0,0,0,0,0,0
+        total_loss,recon_loss,preserve_loss,adv_loss,total_discri_loss = \
+            0,0,0,0,0
         for step, (X,b,m,i,w) in enumerate(train_data):
             X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
             X.requires_grad = True
@@ -113,23 +113,21 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 loss.backward() 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1) 
                 if (step + 1) % accumulation_steps == 0:
-                    optimizer_vae.step()
-                    optimizer_vae.zero_grad()      
+                    optimizer_gen.step()
+                    optimizer_gen.zero_grad()      
                 if (writer is not None) & (adaptlr == True):
-                    writer.add_scalar("lr_vae/train",scheduler_vae.get_last_lr()[0],epoch*num_batch+step)
+                    writer.add_scalar("lr_gen/train",scheduler_gen.get_last_lr()[0],epoch*num_batch+step)
                 if adaptlr == True:    
-                    scheduler_vae.step()
+                    scheduler_gen.step()
                 
                 total_loss+=loss.item()
                 recon_loss+=loss_dict['recon_loss']
-                kl_z+=loss_dict['kl_z']
                 preserve_loss+=loss_dict['preserve_loss']
                 
                 # print(loss)
                 if writer is not None:
                     writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
                     writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
-                    writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], epoch*num_batch+step+1)
                     writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
 
             elif epoch >= num_warmup:
@@ -148,24 +146,39 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 if adaptlr == True:    
                     scheduler_d.step()
 
-                ### === Phase B: Train VAE, fool Discriminator === ###
+                ### === Phase B: Train Generator (Diffusion), fool Discriminator === ###
                 model.train()
                 model.discriminator.eval()
-                _, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")
+                _, _, loss, loss_dict = model(X,b,m,i,w,stage="diffusion")
                 # with torch.autograd.detect_anomaly():
                 loss.backward() 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1) 
                 if (step + 1) % accumulation_steps == 0:
-                    optimizer_vae.step()
-                    optimizer_vae.zero_grad()      
+                    optimizer_gen.step()
+                    optimizer_gen.zero_grad()      
                 if (writer is not None) & (adaptlr == True):
-                    writer.add_scalar("lr_vae/train",scheduler_vae.get_last_lr()[0],epoch*num_batch+step)
+                    writer.add_scalar("lr_gen/train",scheduler_gen.get_last_lr()[0],epoch*num_batch+step)
                 if adaptlr == True:    
-                    scheduler_vae.step()
+                    scheduler_gen.step()
+                # Train Generator multiple times (2x) to keep up with Discriminator
+                for _ in range(2):
+                    model.train()
+                    model.discriminator.eval()
+                    _, _, loss, loss_dict = model(X,b,m,i,w,stage="diffusion")
+                    # with torch.autograd.detect_anomaly():
+                    loss.backward() 
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1) 
+                    if (step + 1) % accumulation_steps == 0:
+                        optimizer_gen.step()
+                        optimizer_gen.zero_grad()      
+                    if (writer is not None) & (adaptlr == True):
+                        writer.add_scalar("lr_gen/train",scheduler_gen.get_last_lr()[0],epoch*num_batch+step)
+                    if adaptlr == True:    
+                        scheduler_gen.step()
                 
+                # Log the last generator step metrics
                 total_loss+=loss.item()
                 recon_loss+=loss_dict['recon_loss']
-                kl_z+=loss_dict['kl_z']
                 preserve_loss+=loss_dict['preserve_loss']
                 adv_loss+=loss_dict['adv_loss']
                 total_discri_loss+=discri_loss.item()
@@ -174,7 +187,6 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 if writer is not None:
                     writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
                     writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
-                    writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], epoch*num_batch+step+1)
                     writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("adv_Loss/train", loss_dict['adv_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("discri_Loss/train", discri_loss.item(), epoch*num_batch+step+1)
@@ -182,14 +194,13 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         if writer is not None:    
             writer.add_scalar("Loss_epoch/train", total_loss / num_batch, epoch+1)
             writer.add_scalar("recon_Loss_epoch/train", recon_loss / num_batch, epoch+1)
-            writer.add_scalar("KLz_Loss_epoch/train", kl_z / num_batch, epoch+1)
             writer.add_scalar("preserve_Loss_epoch/train", preserve_loss / num_batch, epoch+1)
             writer.add_scalar("adv_Loss_epoch/train", adv_loss / num_batch, epoch+1)
             writer.add_scalar("discri_Loss_epoch/train", total_discri_loss / num_batch, epoch+1)
         
         if (epoch + 1) % 1 == 0:
-            print("epoch {}: loss = {:.4f}, Recon_loss = {:.4f}, KL_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}, discri_loss = {:.4f}".format( # 
-                epoch+1,total_loss / num_batch, recon_loss / num_batch, kl_z / num_batch, preserve_loss / num_batch, adv_loss / num_batch, total_discri_loss / num_batch)) #
+            print("epoch {}: loss = {:.4f}, Diff_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}, discri_loss = {:.4f}".format( # 
+                epoch+1,total_loss / num_batch, recon_loss / num_batch, preserve_loss / num_batch, adv_loss / num_batch, total_discri_loss / num_batch)) #
         
         if epoch >= num_warmup:
             if early_stopping:
@@ -213,7 +224,7 @@ def validate_model(device, validate_dataset, model, batch_size):
     total_loss= 0
     for _, (X,b,m,i,w) in enumerate(validate_data):
         X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
-        _,_,loss,_ = model(X,b,m,i,w,stage="vae")
+        _,_,loss,_ = model(X,b,m,i,w,stage="diffusion")
         total_loss+=loss.item()    
     return loss
 
@@ -231,16 +242,15 @@ def inference_model(device, inference_dataset, model, batch_size):
     inference_data = DataLoader(inference_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
     z1_list = []
     z2_list = []
-    total_loss,recon_loss,kl_z,preserve_loss,adv_loss= \
-            0,0,0,0,0
+    total_loss,recon_loss,preserve_loss,adv_loss= \
+            0,0,0,0
     for step, (X,b,m,i,w) in enumerate(inference_data):
         X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
-        z1,z2,loss,loss_dict = model(X,b,m,i,w,stage="vae")
+        z1,z2,loss,loss_dict = model(X,b,m,i,w,stage="diffusion")
         z1_list.append(z1.detach().cpu().numpy())
         z2_list.append(z2.detach().cpu().numpy())
         total_loss+=loss.item()
         recon_loss+=loss_dict['recon_loss']
-        kl_z+=loss_dict['kl_z']
         preserve_loss+=loss_dict['preserve_loss']
         adv_loss+=loss_dict['adv_loss']
         # total_discri_loss+=discri_loss.item()
@@ -248,8 +258,7 @@ def inference_model(device, inference_dataset, model, batch_size):
     z_shared = np.concatenate(z1_list, axis=0)
     z_specific = np.concatenate(z2_list, axis=0)
     num_batch = np.ceil(len(inference_dataset)/batch_size)
-    print("inference: loss = {:.4f}, Recon_loss = {:.4f}, KL_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}".format( # 
-          total_loss / num_batch, recon_loss / num_batch, kl_z / num_batch, preserve_loss / num_batch, adv_loss / num_batch))  #
+    print("inference: loss = {:.4f}, Diff_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}".format( # 
+          total_loss / num_batch, recon_loss / num_batch, preserve_loss / num_batch, adv_loss / num_batch))  #
     
     return z_shared, z_specific
-

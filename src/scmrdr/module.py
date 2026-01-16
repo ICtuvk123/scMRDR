@@ -128,7 +128,7 @@ class Integration:
             raise ValueError("Distribution not recognized!")
 
     def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5, 
-              beta = 2, gamma = 1, lambda_adv = 0.01, device=None):
+              beta = None, gamma = 1, lambda_adv = 0.01, device=None):
         '''
         Setup the model.
         Args:
@@ -136,7 +136,6 @@ class Integration:
             latent_dim_shared: int, latent dimension of the shared latent space
             latent_dim_specific: int, latent dimension of the specific latent space
             dropout_rate: float, dropout rate in neural network
-            beta: float, beta parameter for the beta distribution
             gamma: float, gamma parameter for the gamma distribution
             lambda_adv: float, lambda parameter for the adversarial loss
             device: device to train the model. Default is None, indicating GPU will be used if available.
@@ -146,7 +145,6 @@ class Integration:
         self.latent_dim_shared = latent_dim_shared
         self.latent_dim_specific = latent_dim_specific
         self.dropout_rate = dropout_rate
-        self.beta = beta
         self.gamma = gamma
         self.lambda_adv = lambda_adv
         
@@ -157,12 +155,12 @@ class Integration:
         print("using "+str(self.device))
         self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers, 
                     latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate, 
-                    beta=self.beta, gamma = self.gamma, lambda_adv = self.lambda_adv,
+                    gamma = self.gamma, lambda_adv = self.lambda_adv,
                     feat_mask = self.feat_mask, distribution = self.distribution).to(self.device)
         self.train_dataset = CombinedDataset(self.data,self.covariates,self.modality,self.mask, self.celltype)
     
     def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1, 
-              adaptlr = False, valid_prop = 0.1, num_warmup = 0, early_stopping = True, patience = 10,
+              adaptlr = False, valid_prop = 0.1, num_warmup = 0, early_stopping = False, patience = 10,
               weighted = False,
               tensorboard = False, savepath = "./", random_state=42):
         '''

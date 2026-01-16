@@ -30,7 +30,7 @@ except:
     APEX_AVAILABLE = False
 import os
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+# os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
 import logging
 import random
 from .Dataset import Dataset
@@ -88,6 +88,8 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        if self.dim % 2 == 1:
+            emb = torch.cat((emb, torch.zeros_like(emb[:, :1])), dim=-1)
         return emb
 
 class EMA():
@@ -172,6 +174,10 @@ class ModalityDiscriminator(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, num_modalities).
         '''
+        # Add noise to the input to make the discriminator's job harder
+        if self.training:
+            z = z + torch.randn_like(z) * 0.1
+            
         z = self.model(z)
         return z
 
@@ -332,8 +338,8 @@ class Encoder(nn.Module):
             current_dim = dim
         self.zxy_encoder = nn.Sequential(*layers_zxy) 
         
-        self.mu_layer = nn.Linear(layer_dims[-1], latent_dim)
-        self.logvar_layer = nn.Linear(layer_dims[-1], latent_dim)
+        self.z_layer = nn.Linear(layer_dims[-1], latent_dim)
+        self.norm = nn.LayerNorm(latent_dim)
         
     def forward(self,x):
         '''
@@ -342,26 +348,39 @@ class Encoder(nn.Module):
         #     x (torch.Tensor): Input tensor of shape (batch_size, input_dim).
         # Returns:
         #     z (torch.Tensor): Latent variable tensor of shape (batch_size, latent_dim).
-        #     mu (torch.Tensor): Mean of the latent variable distribution.
-        #     logvar (torch.Tensor): Log variance of the latent variable distribution.
         '''
         h = self.zxy_encoder(x)
-        mu = self.mu_layer(h)
-        logvar = self.logvar_layer(h)
-        z = self.reparameterize(mu, logvar)
-        return z, mu, logvar #
-    
-    def reparameterize(self, mu, logvar):
-        # Reparameterization trick to sample from the latent variable distribution.
-        # Args:
-        #     mu (torch.Tensor): Mean of the latent variable distribution.
-        #     logvar (torch.Tensor): Log variance of the latent variable distribution.
-        # Returns:
-        #     z (torch.Tensor): Sampled latent variable tensor
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
+        z = self.z_layer(h)
+        z = self.norm(z)
         return z
+
+class GEGLU(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, dim_out = None, mult = 4, glu = False, dropout = 0.):
+        super().__init__()
+        inner_dim = int(dim * mult)
+        dim_out = default(dim_out, dim)
+        project_in = nn.Sequential(
+            nn.Linear(dim, inner_dim),
+            nn.GELU()
+        ) if not glu else GEGLU(dim, inner_dim)
+
+        self.net = nn.Sequential(
+            project_in,
+            nn.Dropout(dropout),
+            nn.Linear(inner_dim, dim_out)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class CrossAttention(nn.Module):
     def __init__(self,
@@ -433,7 +452,7 @@ class BasicTransformerBlock(nn.Module):
         assert self_attn or cross_attn, 'At least on attention layer'
         self.self_attn = self_attn
         self.cross_attn = cross_attn
-        self.ff = FeedForward(dim, dropout=dropout, glu = gated_ff)
+        self.ff = FeedForward(dim, dropout=dropout, glu = gated_ff, mult=1)
         if ts_cross_attn:
             raise NotImplementedError("Deprecated, please remove.")  # FIX: remove ts_cross_attn option
         else:
@@ -827,12 +846,11 @@ class EmbeddingNet(nn.Module):
 
     def __init__(self, device, input_dim, modality_num, covariate_dim = 1, celltype_num = 0,
                 layer_dims=[500,100], latent_dim_shared=20,
-                latent_dim_specific=20, dropout_rate = 0.5, beta = 2, gamma = 1, lambda_adv = 0.01,
+                latent_dim_specific=20, dropout_rate = 0.5, gamma = 1, lambda_adv = 0.01,
                 feat_mask = None, distribution = "ZINB", # count_data = True, positive_outputs = True,
                 encoder_covariates=False, eps=1e-10):
         super(EmbeddingNet, self).__init__()
         
-        self.beta = beta
         self.device = device
         self.eps = eps
         # self.paired= paired
@@ -870,11 +888,8 @@ class EmbeddingNet(nn.Module):
         denoise_out_dim = X_dim
         self.Denoise_model = Denoise_net(X_dim, denoise_out_dim, context_dim=z_total_dim, out_act=None)
         self.diffusion_model = ZINBDiffusion(self.Denoise_model, profile_size=X_dim, gene_num=input_dim, loss_type="l2")
+        self.decoder = self.diffusion_model
             
-        self.prior_net_specific = nn.Sequential(nn.Linear(modality_num + self.celltype_num, 10),
-                                    nn.LeakyReLU(0.1),
-                                    nn.Dropout(dropout_rate),
-                                    nn.Linear(10, 2))
         self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)   
     
     def forward(self,x,b,m,i,w,stage="diffusion"):
@@ -888,8 +903,8 @@ class EmbeddingNet(nn.Module):
             w (torch.Tensor): Cell type information tensor of shape (batch_size, celltype_num).
             stage (str): Stage of the model, can be "diffusion", "discriminator", or "warmup".
         Returns:
-            mu_shared (torch.Tensor): Mean of the shared latent variable distribution.
-            mu_specific (torch.Tensor): Mean of the specific latent variable distribution.
+            z_shared (torch.Tensor): Shared latent variable.
+            z_specific (torch.Tensor): Specific latent variable.
             total_loss (torch.Tensor): Total loss for the model.
             loss_dict (dict): Dictionary containing individual loss components.
         '''
@@ -898,21 +913,19 @@ class EmbeddingNet(nn.Module):
                 x = torch.log1p(x)
             
             if self.celltype_num == 0:
-                prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(m), 2, dim=-1)
                 if self.encoder_covariates:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
+                    z_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
+                    z_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
                 else:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
+                    z_shared = self.encoder_shared(x)
+                    z_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
             else:
-                prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(torch.cat([m,w],dim=-1)), 2, dim=-1)
                 if self.encoder_covariates:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b,w],dim=-1))
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b,w],dim=-1))
+                    z_shared = self.encoder_shared(torch.cat([x,b,w],dim=-1))
+                    z_specific = self.encoder_specific(torch.cat([x,m,b,w],dim=-1))
                 else:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,w],dim=-1))
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,w],dim=-1))
+                    z_shared = self.encoder_shared(torch.cat([x,w],dim=-1))
+                    z_specific = self.encoder_specific(torch.cat([x,m,w],dim=-1))
             
             # concat z_shared adn z_specific to predict q(x|z)
             z = torch.cat([z_shared,z_specific],dim=-1)
@@ -925,11 +938,8 @@ class EmbeddingNet(nn.Module):
                 diff_inputs.append(w)
             diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
             
-            kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
-                klLoss(mu_shared, logvar_shared)
             # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
-            preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)
-            # preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
+            preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # preserve_loss = sammon_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # preserve_loss = laplacian_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # preserve_loss = frobenius_isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
@@ -937,33 +947,35 @@ class EmbeddingNet(nn.Module):
             #z_per_class = [z_shared[m[:, i].bool()] for i in range(m.shape[1])]
             #align_loss = torch.stack([MMD(z_per_class[0], z_per_class[i]) for i in range(1, len(z_per_class))]).sum()
 
-            modality_labels = torch.argmax(m, dim=1)
+            # modality_labels = torch.argmax(m, dim=1)
             modality_logits_adv = self.discriminator(z_shared)  # gradients allowed here
-            adv_loss = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='sum')/m.shape[0]
+            
+            # FIX: Use Entropy Maximization instead of negative CrossEntropy to prevent unbounded loss collapse
+            probs = F.softmax(modality_logits_adv, dim=1)
+            log_probs = F.log_softmax(modality_logits_adv, dim=1)
+            entropy = -(probs * log_probs).sum(dim=1).mean()
+            adv_loss = -entropy # Minimize -entropy -> Maximize entropy (confusion)
 
             # z_shared_detached = z_shared.clone().detach()
             # modality_logits = self.discriminator(z_shared_detached) #
             # discri_loss = F.cross_entropy(modality_logits, modality_labels, reduction='sum')/m.shape[0]
 
                 
-            total_loss = diffusion_loss + self.beta*kl_z + self.gamma * preserve_loss + self.lambda_adv * adv_loss # + align_loss
+            total_loss = diffusion_loss + self.gamma * preserve_loss + self.lambda_adv * adv_loss # + align_loss
             loss_dict = {'total_loss':total_loss.item(), 
-                        'diffusion_loss':diffusion_loss.item(),'kl_z':kl_z.item(),
+                        'diffusion_loss':diffusion_loss.item(), 'recon_loss':diffusion_loss.item(),
                         'preserve_loss': preserve_loss.item(), #,'align_loss':align_loss.item()
                         'adv_loss': adv_loss.item()
                         } 
-            return mu_shared, mu_specific, total_loss, loss_dict
+            return z_shared, z_specific, total_loss, loss_dict
         elif stage=="discriminator":
             if self.count_data:
                 x = torch.log1p(x)
             
-            # prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(m), 2, dim=-1)
             if self.encoder_covariates:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
-                # z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
+                z_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
             else:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
-                # z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
+                z_shared = self.encoder_shared(x)
     
             # rho2,dispersion2,pi2 = self.decoder2(z_shared, b, m)
             
@@ -978,13 +990,12 @@ class EmbeddingNet(nn.Module):
             if self.count_data:
                 x = torch.log1p(x)
             
-            prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(m), 2, dim=-1)
             if self.encoder_covariates:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
-                z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
+                z_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
+                z_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
             else:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
-                z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
+                z_shared = self.encoder_shared(x)
+                z_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
             z = torch.cat([z_shared,z_specific],dim=-1)
             z_context = z.unsqueeze(1)
             
@@ -996,29 +1007,15 @@ class EmbeddingNet(nn.Module):
             diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
             
             # loss
-            kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
-                klLoss(mu_shared, logvar_shared)
-            preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)  
+            preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)  
             # hsic = 1000 * HSICloss(z_shared,m)
-            total_loss = diffusion_loss + self.beta*kl_z + self.gamma * preserve_loss #+ hsic
-            loss_dict = {'diffusion_loss':diffusion_loss.item(),'kl_z':kl_z.item(),
+            total_loss = diffusion_loss + self.gamma * preserve_loss #+ hsic
+            loss_dict = {'diffusion_loss':diffusion_loss.item(), 'recon_loss':diffusion_loss.item(),
                         'preserve_loss': preserve_loss.item(),
                         # 'hsic': hsic.item(),
                         'total_loss':total_loss.item()
                         } 
-            return mu_shared, mu_specific, total_loss, loss_dict
+            return z_shared, z_specific, total_loss, loss_dict
     
-    def reparameterize(self, mu, logvar):
-        '''
-        Reparameterization trick to sample from the latent variable distribution.
-        Args:
-            mu (torch.Tensor): Mean of the latent variable distribution.
-            logvar (torch.Tensor): Log variance of the latent variable distribution.
-        Returns:
-            z (torch.Tensor): Sampled latent variable tensor.
-        '''
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
 
     

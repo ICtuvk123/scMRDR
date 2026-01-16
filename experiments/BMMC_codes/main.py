@@ -17,8 +17,9 @@ import scanpy as sc
 # from module import Integration
 
 import sys
-sys.path.insert(1, '/home/bingxing2/ailab/group/ai4bio/sunjianle/integration/models2')
-from module import Integration
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from scMRDR.module import Integration
 
 
 adata = sc.read_h5ad("/home/bingxing2/ailab/group/ai4bio/sunjianle/mop/BMMC/feature_aligned_sampled.h5ad")
@@ -40,4 +41,3 @@ model.inference(n_samples=1,update=True,returns=False)
 adata = model.get_adata()
 adata.write("/home/bingxing2/ailab/group/ai4bio/sunjianle/mop/BMMC/feature_aligned_trained_sampled.h5ad")
 # adata.write("/home/bingxing2/ailab/group/ai4bio/sunjianle/BMMC/data2/feature_aligned_unpaired_trained_mse.h5ad")
-
