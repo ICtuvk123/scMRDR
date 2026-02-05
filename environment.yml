@@ -1,0 +1,12 @@
+name: scMRDR_v1
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - bzip2=1.0.8
+  - ca-certificates
+  - libffi=3.5.2
+  - openssl=3.6.0
+  - sqlite
