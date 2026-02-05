@@ -183,13 +183,14 @@ class ModalityDiscriminator(nn.Module):
 
 
 class DisentanglementEncoder(nn.Module):
-    def __init__(self, 
-                 profile_size, 
-                 out_dim, 
-                 num_factor, 
+    def __init__(self,
+                 profile_size,
+                 out_dim,
+                 num_factor,
                  label_categories,
+                 causal_dag=None,  # 新增：因果DAG邻接矩阵
                  bias = False,
-                 out_act = "gelu",  
+                 out_act = "gelu",
                  gamma = 35
                  ):
         super().__init__()
@@ -199,11 +200,25 @@ class DisentanglementEncoder(nn.Module):
         self.out_dim = out_dim
         self.profile_size = profile_size
         self.exogenous_encoder_m_v = nn.Sequential(
-            nn.Linear(profile_size, profile_size // 4), 
-            Mish(), 
+            nn.Linear(profile_size, profile_size // 4),
+            Mish(),
             nn.Linear(profile_size // 4, num_factor * out_dim * 2)
         )
-        
+
+        # 因果图参数初始化
+        if causal_dag is not None:
+            # causal_dag: (num_factor, num_factor) 邻接矩阵
+            # A[i,j]=1 表示 factor_j -> factor_i (j是i的父节点)
+            self.causal_dag = nn.Parameter(causal_dag)
+            self.causal_dag.requires_grad = False
+            self.I = nn.Parameter(torch.eye(num_factor))
+            self.I.requires_grad = False
+            self.use_causal = True
+        else:
+            self.use_causal = False
+            self.register_parameter('causal_dag', None)
+            self.register_parameter('I', None)
+
         if bias:
             self.bias = nn.Parameter(torch.Tensor(num_factor))
         else:
@@ -213,7 +228,7 @@ class DisentanglementEncoder(nn.Module):
         for idx, num in enumerate(label_categories):
             self.label_predictor.append(nn.Sequential(
                 nn.Linear(out_dim, num),
-                nn.Softmax(dim = 1) 
+                nn.Softmax(dim = 1)
             )
             )
 
@@ -223,9 +238,22 @@ class DisentanglementEncoder(nn.Module):
         self.discriminator_ov = nn.Linear(out_dim, 1)
         self.discriminator_ov2 = nn.Linear(num_factor, 1)
         self.discriminator_ov_act = nn.Sigmoid()
-        
+
         self.gamma = gamma
-    
+
+    def mask_z(self, x):
+        """
+        通过因果DAG对概念嵌入进行掩码变换。
+        用于计算因果一致性约束损失。
+        Args:
+            x: (batch, num_factor, out_dim) 概念嵌入
+        Returns:
+            masked_x: (batch, num_factor, out_dim) 掩码后的嵌入
+        """
+        # matmul: (num_factor, num_factor) @ (batch, num_factor, out_dim)
+        # 需要转置以适配矩阵乘法
+        return torch.matmul(self.causal_dag, x)
+
     def normal_kl(self, mean1, logvar1, mean2, logvar2):
         """
         Compute the KL divergence between two gaussians.
@@ -268,14 +296,28 @@ class DisentanglementEncoder(nn.Module):
     def forward(self, x, o):
         exogenous_factor_m, exogenous_factor_v = torch.split(self.exogenous_encoder_m_v(x), self.num_factor * self.out_dim, dim=-1)
         prior_kl = self.calculat_prior_kl(exogenous_factor_m, exogenous_factor_v).mean()
-        
+
         exogenous_factor = self.sample(exogenous_factor_m, exogenous_factor_v)
         exogenous_embs = rearrange(exogenous_factor, 'b (h d) -> b h d', h=self.num_factor)
 
-        z = exogenous_embs
-        concept_embs = z
+        # 应用因果结构方程
+        if self.use_causal:
+            # 因果结构方程: z = (I - A)^(-1) * u
+            # 其中 A 是因果DAG邻接矩阵, u 是外生变量(exogenous)
+            # 这个公式来自结构因果模型(SCM): z = Az + u => z = (I-A)^(-1)u
+            z = torch.inverse(self.I - self.causal_dag).matmul(exogenous_embs)
+            concept_embs = z
 
-        mask_recon_loss = torch.tensor(0.0, device=x.device)
+            # 因果一致性约束损失
+            # 验证: z 应该满足 z = Az + u, 即 z - Az = u
+            # mask_z(z) = Az, 所以 mask_z(z) + u 应该等于 z
+            m_concept_embs = self.mask_z(concept_embs) + exogenous_embs
+            mask_recon_loss = ((concept_embs - m_concept_embs) ** 2).mean()
+        else:
+            # 无因果约束时，直接使用外生嵌入
+            z = exogenous_embs
+            concept_embs = z
+            mask_recon_loss = torch.tensor(0.0, device=x.device)
         
         pred_o = []
         for idx, predictor in enumerate(self.label_predictor):
@@ -302,12 +344,62 @@ class DisentanglementEncoder(nn.Module):
         return concept_embs, mask_recon_loss, pred_o_loss, discriminator_loss, prior_kl
     
     def extract_exogenous_embs(self, x):
+        """提取外生变量嵌入 (用于因果干预)"""
         with torch.no_grad():
             exogenous_factor_m, exogenous_factor_v = torch.split(self.exogenous_encoder_m_v.eval()(x), self.num_factor * self.out_dim, dim=-1)
             exogenous_factor = self.sample(exogenous_factor_m, exogenous_factor_v)
             exogenous_embs = rearrange(exogenous_factor, 'b (h d) -> b h d', h=self.num_factor)
         return exogenous_embs
 
+    def extract_concept_embs(self, x):
+        """
+        提取概念嵌入 (应用因果结构方程后的嵌入)
+        用于反事实生成时提取参考样本的概念表示
+        Args:
+            x: (batch, profile_size) 输入数据
+        Returns:
+            concept_embs: (batch, num_factor, out_dim) 概念嵌入
+        """
+        with torch.no_grad():
+            exogenous_embs = self.extract_exogenous_embs(x)
+            if self.use_causal:
+                # 应用因果结构方程: z = (I - A)^(-1) * u
+                concept_embs = torch.inverse(self.I - self.causal_dag).matmul(exogenous_embs)
+            else:
+                concept_embs = exogenous_embs
+        return concept_embs
+
+    def causality_based_transform(self, exogenous_embs):
+        """
+        将外生嵌入通过因果DAG转换为概念嵌入
+        用于反事实生成: 先干预外生嵌入，再通过此函数转换
+        Args:
+            exogenous_embs: (batch, num_factor, out_dim) 外生嵌入 (可能已被干预)
+        Returns:
+            concept_embs: (batch, num_factor, out_dim) 因果一致的概念嵌入
+        """
+        if self.use_causal:
+            return torch.inverse(self.I - self.causal_dag).matmul(exogenous_embs)
+        else:
+            return exogenous_embs
+
+    def intervene_and_transform(self, exogenous_embs, target_factor_idx, target_embs):
+        """
+        对特定因子进行干预并应用因果转换
+        实现 do(factor_i = value) 操作
+        Args:
+            exogenous_embs: (batch, num_factor, out_dim) 原始外生嵌入
+            target_factor_idx: int, 要干预的因子索引
+            target_embs: (batch, out_dim) 干预后的目标嵌入值
+        Returns:
+            concept_embs: (batch, num_factor, out_dim) 干预后的概念嵌入
+        """
+        # 复制外生嵌入以避免修改原始数据
+        intervened_embs = exogenous_embs.clone()
+        # 执行干预: 替换目标因子
+        intervened_embs[:, target_factor_idx, :] = target_embs
+        # 应用因果转换
+        return self.causality_based_transform(intervened_embs)
 
 
 class Encoder(nn.Module):
