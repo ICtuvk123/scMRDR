@@ -46,9 +46,9 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         self.val_loss_min = val_loss
 
-def train_model(device, writer, train_dataset, validate_dataset, model, epoch_num, batch_size, 
+def train_model(device, writer, train_dataset, validate_dataset, model, epoch_num, batch_size,
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
-                sample_weights=None): #inferenceRNA, inferenceATAC, 
+                sample_weights=None, trial=None): #inferenceRNA, inferenceATAC,
     '''
     Train the model.
     Args:
@@ -207,11 +207,22 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         if epoch >= num_warmup:
             if early_stopping:
                 validate_loss = validate_model(device, validate_dataset, model, batch_size)
+                # Optuna pruning support
+                if trial is not None:
+                    import optuna
+                    trial.report(validate_loss, epoch)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
                 early_stopping(validate_loss, model)
                 if early_stopping.early_stop:
                     print(f"Early stopping at epoch {epoch+1}")
                     model.load_state_dict(torch.load(early_stopping.path))
                     break
+
+    # Return best validation loss for Optuna
+    if isinstance(early_stopping, EarlyStopping):
+        return early_stopping.val_loss_min
+    return None
 
 def validate_model(device, validate_dataset, model, batch_size):
     '''
@@ -225,11 +236,14 @@ def validate_model(device, validate_dataset, model, batch_size):
     model.eval()
     validate_data = DataLoader(validate_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
     total_loss= 0
-    for _, (X,b,m,i,w) in enumerate(validate_data):
-        X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
-        _,_,loss,_ = model(X,b,m,i,w,stage="diffusion")
-        total_loss+=loss.item()    
-    return loss
+    num_batches = 0
+    with torch.no_grad():
+        for _, (X,b,m,i,w) in enumerate(validate_data):
+            X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
+            _,_,loss,_ = model(X,b,m,i,w,stage="diffusion")
+            total_loss+=loss.item()
+            num_batches += 1
+    return total_loss / max(num_batches, 1)
 
 
 def inference_model(device, inference_dataset, model, batch_size):

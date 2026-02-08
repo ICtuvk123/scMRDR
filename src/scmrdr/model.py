@@ -33,7 +33,7 @@ import os
 # os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
 import logging
 import random
-from .Dataset import Dataset
+# from .Dataset import Dataset
 
 def get_logger(filename, verbosity=1, name=None):
     level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
@@ -188,7 +188,7 @@ class DisentanglementEncoder(nn.Module):
                  out_dim,
                  num_factor,
                  label_categories,
-                 causal_dag=None,  # 新增：因果DAG邻接矩阵
+                 causal_dag=None,  
                  bias = False,
                  out_act = "gelu",
                  gamma = 35
@@ -205,10 +205,7 @@ class DisentanglementEncoder(nn.Module):
             nn.Linear(profile_size // 4, num_factor * out_dim * 2)
         )
 
-        # 因果图参数初始化
         if causal_dag is not None:
-            # causal_dag: (num_factor, num_factor) 邻接矩阵
-            # A[i,j]=1 表示 factor_j -> factor_i (j是i的父节点)
             self.causal_dag = nn.Parameter(causal_dag)
             self.causal_dag.requires_grad = False
             self.I = nn.Parameter(torch.eye(num_factor))
@@ -243,15 +240,15 @@ class DisentanglementEncoder(nn.Module):
 
     def mask_z(self, x):
         """
-        通过因果DAG对概念嵌入进行掩码变换。
-        用于计算因果一致性约束损失。
+        Mask transformation of concept embeddings via causal DAG.
+        Used to calculate causal consistency constraint loss.
         Args:
-            x: (batch, num_factor, out_dim) 概念嵌入
+            x: (batch, num_factor, out_dim) concept embeddings
         Returns:
-            masked_x: (batch, num_factor, out_dim) 掩码后的嵌入
+            masked_x: (batch, num_factor, out_dim) masked embeddings
         """
         # matmul: (num_factor, num_factor) @ (batch, num_factor, out_dim)
-        # 需要转置以适配矩阵乘法
+        # Transpose needed to adapt to matrix multiplication
         return torch.matmul(self.causal_dag, x)
 
     def normal_kl(self, mean1, logvar1, mean2, logvar2):
@@ -300,21 +297,21 @@ class DisentanglementEncoder(nn.Module):
         exogenous_factor = self.sample(exogenous_factor_m, exogenous_factor_v)
         exogenous_embs = rearrange(exogenous_factor, 'b (h d) -> b h d', h=self.num_factor)
 
-        # 应用因果结构方程
+        # Apply causal structural equations
         if self.use_causal:
-            # 因果结构方程: z = (I - A)^(-1) * u
-            # 其中 A 是因果DAG邻接矩阵, u 是外生变量(exogenous)
-            # 这个公式来自结构因果模型(SCM): z = Az + u => z = (I-A)^(-1)u
+            # Causal structural equation: z = (I - A)^(-1) * u
+            # Where A is the causal DAG adjacency matrix, u is the exogenous variable
+            # This formula comes from Structural Causal Model (SCM): z = Az + u => z = (I-A)^(-1)u
             z = torch.inverse(self.I - self.causal_dag).matmul(exogenous_embs)
             concept_embs = z
 
-            # 因果一致性约束损失
-            # 验证: z 应该满足 z = Az + u, 即 z - Az = u
-            # mask_z(z) = Az, 所以 mask_z(z) + u 应该等于 z
+            # Causal consistency constraint loss
+            # Verification: z should satisfy z = Az + u, i.e., z - Az = u
+            # mask_z(z) = Az, so mask_z(z) + u should equal z
             m_concept_embs = self.mask_z(concept_embs) + exogenous_embs
             mask_recon_loss = ((concept_embs - m_concept_embs) ** 2).mean()
         else:
-            # 无因果约束时，直接使用外生嵌入
+            # When there is no causal constraint, use exogenous embeddings directly
             z = exogenous_embs
             concept_embs = z
             mask_recon_loss = torch.tensor(0.0, device=x.device)
@@ -344,7 +341,7 @@ class DisentanglementEncoder(nn.Module):
         return concept_embs, mask_recon_loss, pred_o_loss, discriminator_loss, prior_kl
     
     def extract_exogenous_embs(self, x):
-        """提取外生变量嵌入 (用于因果干预)"""
+        """Extract exogenous variable embeddings (used for causal intervention)"""
         with torch.no_grad():
             exogenous_factor_m, exogenous_factor_v = torch.split(self.exogenous_encoder_m_v.eval()(x), self.num_factor * self.out_dim, dim=-1)
             exogenous_factor = self.sample(exogenous_factor_m, exogenous_factor_v)
@@ -353,17 +350,17 @@ class DisentanglementEncoder(nn.Module):
 
     def extract_concept_embs(self, x):
         """
-        提取概念嵌入 (应用因果结构方程后的嵌入)
-        用于反事实生成时提取参考样本的概念表示
+        Extract concept embeddings (embeddings after applying causal structural equations)
+        Used to extract concept representation of reference samples during counterfactual generation
         Args:
-            x: (batch, profile_size) 输入数据
+            x: (batch, profile_size) input data
         Returns:
-            concept_embs: (batch, num_factor, out_dim) 概念嵌入
+            concept_embs: (batch, num_factor, out_dim) concept embeddings
         """
         with torch.no_grad():
             exogenous_embs = self.extract_exogenous_embs(x)
             if self.use_causal:
-                # 应用因果结构方程: z = (I - A)^(-1) * u
+                # Apply causal structural equation: z = (I - A)^(-1) * u
                 concept_embs = torch.inverse(self.I - self.causal_dag).matmul(exogenous_embs)
             else:
                 concept_embs = exogenous_embs
@@ -371,12 +368,12 @@ class DisentanglementEncoder(nn.Module):
 
     def causality_based_transform(self, exogenous_embs):
         """
-        将外生嵌入通过因果DAG转换为概念嵌入
-        用于反事实生成: 先干预外生嵌入，再通过此函数转换
+        Transform exogenous embeddings to concept embeddings via causal DAG
+        Used for counterfactual generation: intervene on exogenous embeddings first, then transform via this function
         Args:
-            exogenous_embs: (batch, num_factor, out_dim) 外生嵌入 (可能已被干预)
+            exogenous_embs: (batch, num_factor, out_dim) exogenous embeddings (possibly intervened)
         Returns:
-            concept_embs: (batch, num_factor, out_dim) 因果一致的概念嵌入
+            concept_embs: (batch, num_factor, out_dim) causally consistent concept embeddings
         """
         if self.use_causal:
             return torch.inverse(self.I - self.causal_dag).matmul(exogenous_embs)
@@ -385,20 +382,20 @@ class DisentanglementEncoder(nn.Module):
 
     def intervene_and_transform(self, exogenous_embs, target_factor_idx, target_embs):
         """
-        对特定因子进行干预并应用因果转换
-        实现 do(factor_i = value) 操作
+        Intervene on specific factors and apply causal transformation
+        Implement do(factor_i = value) operation
         Args:
-            exogenous_embs: (batch, num_factor, out_dim) 原始外生嵌入
-            target_factor_idx: int, 要干预的因子索引
-            target_embs: (batch, out_dim) 干预后的目标嵌入值
+            exogenous_embs: (batch, num_factor, out_dim) original exogenous embeddings
+            target_factor_idx: int, index of the factor to intervene
+            target_embs: (batch, out_dim) target embedding values after intervention
         Returns:
-            concept_embs: (batch, num_factor, out_dim) 干预后的概念嵌入
+            concept_embs: (batch, num_factor, out_dim) concept embeddings after intervention
         """
-        # 复制外生嵌入以避免修改原始数据
+        # Clone exogenous embeddings to avoid modifying original data
         intervened_embs = exogenous_embs.clone()
-        # 执行干预: 替换目标因子
+        # Perform intervention: replace target factor
         intervened_embs[:, target_factor_idx, :] = target_embs
-        # 应用因果转换
+        # Apply causal transformation
         return self.causality_based_transform(intervened_embs)
 
 
@@ -591,6 +588,7 @@ class Denoise_net(nn.Module):
     def __init__(self, 
                  dim, 
                  out_dim, 
+                 hidden_dim = None,
                  context_dim = None,
                  depth = 4,
                  num_heads = 4, 
@@ -607,13 +605,16 @@ class Denoise_net(nn.Module):
         if isinstance(out_act, str) or out_act is None:
             out_act = create_activation(out_act)
         
+        hidden_dim = default(hidden_dim, dim)
+        self.proj_in = nn.Linear(dim, hidden_dim) if dim != hidden_dim else nn.Identity()
+        
         if with_time_emb:
-            time_dim = dim
+            time_dim = hidden_dim
             self.time_mlp = nn.Sequential(
-                SinusoidalPosEmb(dim), 
-                nn.Linear(dim, dim * 4), 
+                SinusoidalPosEmb(hidden_dim), 
+                nn.Linear(hidden_dim, hidden_dim * 4), 
                 Mish(),
-                nn.Linear(dim * 4, dim)
+                nn.Linear(hidden_dim * 4, hidden_dim)
             )
         else:
             time_dim = None
@@ -622,21 +623,21 @@ class Denoise_net(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(num_layers - 1):
             self.layers.append(nn.Sequential(
-                nn.Linear(dim, dim),
+                nn.Linear(hidden_dim, hidden_dim),
                 act,
-                create_norm(norm_type, dim),
+                create_norm(norm_type, hidden_dim),
                 nn.Dropout(dropout)
             ))
-        self.layers.append(nn.Sequential(nn.Linear(dim, out_dim), out_act))
+        self.layers.append(nn.Sequential(nn.Linear(hidden_dim, out_dim), out_act))
         
         # the embeddings will be given by encoder during the whole training part
 
         self.Cross_attention_module = nn.ModuleList([
-            BasicTransformerBlock(out_dim, num_heads, dim_head, self_attn=False, cross_attn=True, context_dim=context_dim, 
+            BasicTransformerBlock(hidden_dim, num_heads, dim_head, self_attn=False, cross_attn=True, context_dim=context_dim, 
                                   qkv_bias=True, dropout=dropout, final_act=None)
             for _ in range(depth)
         ])
-        self.decoder_norm = create_norm(norm_type, out_dim)
+        self.decoder_norm = create_norm(norm_type, hidden_dim)
         
     def forward(self, x, x_start, time, embeddings=None):
         # if self.cond_embed is not None:
@@ -645,6 +646,7 @@ class Denoise_net(nn.Module):
 
         # if labels is not None and concept_embs is None:
 
+        x = self.proj_in(x)
         t = self.time_mlp(time) if exists(self.time_mlp) else None
         x = x + t
         x = x.unsqueeze(1)
@@ -688,22 +690,25 @@ class Denoise_net(nn.Module):
         #     return
 
 class ZINBDiffusion(nn.Module):
-    def __init__(self, 
-                 denoise_fn, 
-                 *, 
-                 profile_size, 
+    def __init__(self,
+                 denoise_fn,
+                 *,
+                 profile_size,
                  gene_num = None,
-                #  channels = 3, 
-                 timesteps = 1000, 
-                 loss_type = "l1", 
+                 timesteps = 1000,
+                 loss_type = "l1",
                  betas = None):
         super().__init__()
         self.profile_size = profile_size
         self.gene_num = default(gene_num, profile_size)
         self.denoise_fn = denoise_fn
-        
-     
-        
+
+        # ZINB distribution parameters (learnable per-gene)
+        if loss_type == "zinb":
+            self.log_theta = nn.Parameter(torch.zeros(self.gene_num))    # log-dispersion
+            self.logit_pi = nn.Parameter(torch.zeros(self.gene_num))     # logit zero-inflation
+            self.zinb_loss_fn = ZINBLoss()
+
         if exists(betas):
             betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
         else:
@@ -880,31 +885,53 @@ class ZINBDiffusion(nn.Module):
     def p_losses(self, x_start, t, embeddings, weights = 1.0, noise = None, eps = False, **kwargs):
         b, c = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
-        
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         x_recon = self.denoise_fn(x_noisy, x_start, t, embeddings=embeddings)
-        
+
         assert x_recon.shape == x_noisy.shape, "Please check the code and data"
-        
-        if self.loss_type == "l1":
+
+        if self.loss_type == "zinb":
+            # x_start is log1p(counts) ++ [m, b, w], convert gene part back to counts
+            x_counts = torch.expm1(x_start[:, :self.gene_num]).clamp(min=0)
+
+            # ZINB parameters
+            # rho: predicted proportions (softmax → sums to 1 per cell)
+            rho = F.softmax(x_recon[:, :self.gene_num], dim=-1)
+            # s: library size per cell
+            s = x_counts.sum(dim=1, keepdim=True).clamp(min=1)
+            # dispersion & zero-inflation (learnable per-gene)
+            theta = torch.exp(self.log_theta).unsqueeze(0)
+            pi = torch.sigmoid(self.logit_pi).unsqueeze(0)
+
+            gene_loss = self.zinb_loss_fn(x_counts, rho, theta, pi, s)
+
+            # Non-gene features (modality, covariates): L2 loss
+            if self.gene_num < self.profile_size:
+                non_gene_loss = ((x_start[:, self.gene_num:] - x_recon[:, self.gene_num:]) ** 2).sum()
+            else:
+                non_gene_loss = 0.0
+
+            return gene_loss + non_gene_loss
+
+        elif self.loss_type == "l1":
             if eps:
                 loss = (noise - x_recon).abs()
             else:
                 loss = (x_start - x_recon).abs()
         elif self.loss_type == "l2":
-            assert x_recon.shape == x_noisy.shape, "Please check the code and data"
             if eps:
                 loss = (noise - x_recon)**2
             else:
                 loss = (x_start - x_recon)**2
         else:
             raise NotImplementedError()
-        
+
         if isinstance(weights, torch.Tensor):
             loss = (loss * weights[:, None]).sum()
         else:
             loss = (loss * weights).sum()
-        
+
         return loss
     
     def forward(self, x, embeddings, *args, **kwargs):
@@ -940,7 +967,8 @@ class EmbeddingNet(nn.Module):
                 layer_dims=[500,100], latent_dim_shared=20,
                 latent_dim_specific=20, dropout_rate = 0.5, gamma = 1, lambda_adv = 0.01,
                 feat_mask = None, distribution = "ZINB", # count_data = True, positive_outputs = True,
-                encoder_covariates=False, eps=1e-10):
+                encoder_covariates=False, eps=1e-10, use_causal_dag=False,
+                denoise_hidden_dim=None):
         super(EmbeddingNet, self).__init__()
         
         self.device = device
@@ -968,22 +996,50 @@ class EmbeddingNet(nn.Module):
             self.count_data = False
             self.positive_outputs = True
 
-        self.encoder_shared = Encoder(device, input_dim+covariate_dim*encoder_covariates+self.celltype_num, 
+        self.encoder_shared = Encoder(device, input_dim+covariate_dim*encoder_covariates+self.celltype_num,
                                       layer_dims, latent_dim_shared, dropout_rate)
-        self.encoder_specific = Encoder(device, input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num, 
+        self.encoder_specific = Encoder(device, input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num,
                                         layer_dims, latent_dim_specific, dropout_rate)
-        
+
+        # Causal DAG: shared → specific
+        self.use_causal_dag = use_causal_dag
+        if use_causal_dag:
+            assert latent_dim_shared == latent_dim_specific, \
+                "Causal DAG requires latent_dim_shared == latent_dim_specific"
+            # 2×2 DAG: A[i,j]=1 means factor j is parent of factor i
+            # Factor 0: shared (root), Factor 1: specific (child of shared)
+            causal_dag = torch.zeros(2, 2)
+            causal_dag[1, 0] = 1.0  # specific ← shared
+            inv_causal_dag = torch.inverse(torch.eye(2) - causal_dag)
+            self.register_buffer('causal_dag', causal_dag)
+            self.register_buffer('inv_causal_dag', inv_causal_dag)
+
         # Initialize Diffusion Model
         X_dim = input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num
         z_total_dim = latent_dim_shared + latent_dim_specific
         # Output dim: 3 parameters per gene (rho, disp, pi) + rest of the features
         denoise_out_dim = X_dim
-        self.Denoise_model = Denoise_net(X_dim, denoise_out_dim, context_dim=z_total_dim, out_act=None)
-        self.diffusion_model = ZINBDiffusion(self.Denoise_model, profile_size=X_dim, gene_num=input_dim, loss_type="l2")
+        self.Denoise_model = Denoise_net(X_dim, denoise_out_dim, hidden_dim=denoise_hidden_dim, context_dim=z_total_dim, out_act=None)
+        diff_loss_type = "zinb" if self.distribution in ["ZINB", "NB"] else "l2"
+        self.diffusion_model = ZINBDiffusion(self.Denoise_model, profile_size=X_dim, gene_num=input_dim, loss_type=diff_loss_type)
         self.decoder = self.diffusion_model
-            
-        self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)   
-    
+
+        self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)
+
+    def _apply_causal_dag(self, z_shared, z_specific):
+        """
+        Apply SCM transformation: z = (I - A)^{-1} u
+
+        2×2 DAG (shared → specific):
+          z_shared   = u_shared              (pure shared signal)
+          z_specific = u_shared + u_specific (shared + residual)
+        """
+        if not self.use_causal_dag:
+            return z_shared, z_specific
+        u = torch.stack([z_shared, z_specific], dim=1)  # (batch, 2, dim)
+        z = torch.matmul(self.inv_causal_dag, u)        # (batch, 2, dim)
+        return z[:, 0], z[:, 1]
+
     def forward(self,x,b,m,i,w,stage="diffusion"):
         '''
         Forward pass through the embedding network.
@@ -1003,7 +1059,7 @@ class EmbeddingNet(nn.Module):
         if stage=="diffusion":
             if self.count_data:
                 x = torch.log1p(x)
-            
+
             if self.celltype_num == 0:
                 if self.encoder_covariates:
                     z_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
@@ -1018,9 +1074,11 @@ class EmbeddingNet(nn.Module):
                 else:
                     z_shared = self.encoder_shared(torch.cat([x,w],dim=-1))
                     z_specific = self.encoder_specific(torch.cat([x,m,w],dim=-1))
-            
-            # concat z_shared adn z_specific to predict q(x|z)
-            z = torch.cat([z_shared,z_specific],dim=-1)
+
+            # Apply causal DAG: shared → specific
+            z_shared, z_specific = self._apply_causal_dag(z_shared, z_specific)
+
+            z = torch.cat([z_shared, z_specific], dim=-1)
             z_context = z.unsqueeze(1)
 
             diff_inputs = [x, m]
@@ -1029,7 +1087,7 @@ class EmbeddingNet(nn.Module):
             if self.celltype_num > 0:
                 diff_inputs.append(w)
             diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
-            
+
             # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
             preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # preserve_loss = sammon_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
@@ -1081,23 +1139,27 @@ class EmbeddingNet(nn.Module):
         elif stage=="warmup":
             if self.count_data:
                 x = torch.log1p(x)
-            
+
             if self.encoder_covariates:
                 z_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
                 z_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
             else:
                 z_shared = self.encoder_shared(x)
                 z_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
-            z = torch.cat([z_shared,z_specific],dim=-1)
+
+            # Apply causal DAG: shared → specific
+            z_shared, z_specific = self._apply_causal_dag(z_shared, z_specific)
+
+            z = torch.cat([z_shared, z_specific], dim=-1)
             z_context = z.unsqueeze(1)
-            
+
             diff_inputs = [x, m]
             if self.encoder_covariates:
                 diff_inputs.append(b)
             if self.celltype_num > 0:
                 diff_inputs.append(w)
             diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
-            
+
             # loss
             preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)  
             # hsic = 1000 * HSICloss(z_shared,m)

@@ -127,8 +127,9 @@ class Integration:
         else:
             raise ValueError("Distribution not recognized!")
 
-    def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5, 
-              beta = None, gamma = 1, lambda_adv = 0.01, device=None):
+    def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
+              beta = None, gamma = 1, lambda_adv = 0.01, device=None, use_causal_dag=False,
+              denoise_hidden_dim=None):
         '''
         Setup the model.
         Args:
@@ -153,16 +154,19 @@ class Integration:
         else:
             self.device = device
         print("using "+str(self.device))
-        self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers, 
-                    latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate, 
+        self.use_causal_dag = use_causal_dag
+        self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers,
+                    latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate,
                     gamma = self.gamma, lambda_adv = self.lambda_adv,
-                    feat_mask = self.feat_mask, distribution = self.distribution).to(self.device)
+                    feat_mask = self.feat_mask, distribution = self.distribution,
+                    use_causal_dag = self.use_causal_dag,
+                    denoise_hidden_dim = denoise_hidden_dim).to(self.device)
         self.train_dataset = CombinedDataset(self.data,self.covariates,self.modality,self.mask, self.celltype)
     
-    def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1, 
+    def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1,
               adaptlr = False, valid_prop = 0.1, num_warmup = 0, early_stopping = False, patience = 10,
               weighted = False,
-              tensorboard = False, savepath = "./", random_state=42):
+              tensorboard = False, savepath = "./", random_state=42, trial=None):
         '''
         Train the model.
         Args:
@@ -208,20 +212,21 @@ class Integration:
             weights = 1.0 / np.bincount(self.modality.argmax(-1))
             sample_weights = weights[self.modality.argmax(-1)]
             sample_weights = sample_weights[train_indices]
-            train_model(self.device, self.writer, train_dataset, valid_dataset,
+            best_val_loss = train_model(self.device, self.writer, train_dataset, valid_dataset,
                         self.model, self.epoch_num, self.batch_size,
                         self.num_batch, self.lr, accumulation_steps=self.accumulation_steps,
                         adaptlr=self.adaptlr, num_warmup=num_warmup, early_stopping=early_stopping,
-                        patience=patience, sample_weights=sample_weights)
+                        patience=patience, sample_weights=sample_weights, trial=trial)
         else:
-            train_model(self.device, self.writer, train_dataset, valid_dataset,
-                        self.model, self.epoch_num, self.batch_size, 
-                        self.num_batch, self.lr, accumulation_steps = self.accumulation_steps, 
+            best_val_loss = train_model(self.device, self.writer, train_dataset, valid_dataset,
+                        self.model, self.epoch_num, self.batch_size,
+                        self.num_batch, self.lr, accumulation_steps = self.accumulation_steps,
                         adaptlr = self.adaptlr, num_warmup = num_warmup, early_stopping = early_stopping,
-                        patience = patience)
+                        patience = patience, trial=trial)
         if tensorboard:
             self.writer.close()
         print("Training finished!")
+        return best_val_loss
     
     def inference(self, n_samples=1, dataset=None, batch_size=None, update=True, returns=False):
         '''
