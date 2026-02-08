@@ -882,7 +882,7 @@ class ZINBDiffusion(nn.Module):
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
                 )
 
-    def p_losses(self, x_start, t, embeddings, weights = 1.0, noise = None, eps = False, **kwargs):
+    def p_losses(self, x_start, t, embeddings, weights = 1.0, noise = None, eps = False, mask=None, **kwargs):
         b, c = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -898,13 +898,17 @@ class ZINBDiffusion(nn.Module):
             # ZINB parameters
             # rho: predicted proportions (softmax → sums to 1 per cell)
             rho = F.softmax(x_recon[:, :self.gene_num], dim=-1)
-            # s: library size per cell
-            s = x_counts.sum(dim=1, keepdim=True).clamp(min=1)
+            # s: library size per cell (only count measured features)
+            gene_mask = mask[:, :self.gene_num] if mask is not None else None
+            if gene_mask is not None:
+                s = (x_counts * gene_mask).sum(dim=1, keepdim=True).clamp(min=1)
+            else:
+                s = x_counts.sum(dim=1, keepdim=True).clamp(min=1)
             # dispersion & zero-inflation (learnable per-gene)
             theta = torch.exp(self.log_theta).unsqueeze(0)
             pi = torch.sigmoid(self.logit_pi).unsqueeze(0)
 
-            gene_loss = self.zinb_loss_fn(x_counts, rho, theta, pi, s)
+            gene_loss = self.zinb_loss_fn(x_counts, rho, theta, pi, s, mask=gene_mask)
 
             # Non-gene features (modality, covariates): L2 loss
             if self.gene_num < self.profile_size:
@@ -926,6 +930,16 @@ class ZINBDiffusion(nn.Module):
                 loss = (x_start - x_recon)**2
         else:
             raise NotImplementedError()
+
+        if mask is not None:
+            # Apply mask to gene features, keep non-gene features unmasked
+            full_mask = torch.ones_like(loss)
+            full_mask[:, :self.gene_num] = mask[:, :self.gene_num]
+            loss = loss * full_mask
+            # Scale by gene_num / measured_features per sample
+            measured = mask[:, :self.gene_num].sum(dim=1, keepdim=True).clamp(min=1)
+            scale = self.gene_num / measured
+            loss[:, :self.gene_num] = loss[:, :self.gene_num] * scale
 
         if isinstance(weights, torch.Tensor):
             loss = (loss * weights[:, None]).sum()
@@ -1086,7 +1100,8 @@ class EmbeddingNet(nn.Module):
                 diff_inputs.append(b)
             if self.celltype_num > 0:
                 diff_inputs.append(w)
-            diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
+            sample_mask = i @ self.feat_mask  # (batch, input_dim)
+            diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context, mask=sample_mask)
 
             # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
             preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
@@ -1158,10 +1173,11 @@ class EmbeddingNet(nn.Module):
                 diff_inputs.append(b)
             if self.celltype_num > 0:
                 diff_inputs.append(w)
-            diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context)
+            sample_mask = i @ self.feat_mask  # (batch, input_dim)
+            diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context, mask=sample_mask)
 
             # loss
-            preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)  
+            preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # hsic = 1000 * HSICloss(z_shared,m)
             total_loss = diffusion_loss + self.gamma * preserve_loss #+ hsic
             loss_dict = {'diffusion_loss':diffusion_loss.item(), 'recon_loss':diffusion_loss.item(),
