@@ -128,7 +128,7 @@ class Integration:
             raise ValueError("Distribution not recognized!")
 
     def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
-              beta = None, gamma = 1, lambda_adv = 0.01, device=None, use_causal_dag=False,
+              beta = None, gamma = 1, lambda_adv = 0.01, lambda_sp_cls = 1.0, device=None, use_causal_dag=False,
               denoise_hidden_dim=None):
         '''
         Setup the model.
@@ -158,6 +158,7 @@ class Integration:
         self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers,
                     latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate,
                     gamma = self.gamma, lambda_adv = self.lambda_adv,
+                    lambda_sp_cls = lambda_sp_cls,
                     feat_mask = self.feat_mask, distribution = self.distribution,
                     use_causal_dag = self.use_causal_dag,
                     denoise_hidden_dim = denoise_hidden_dim).to(self.device)
@@ -166,7 +167,8 @@ class Integration:
     def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1,
               adaptlr = False, valid_prop = 0.1, num_warmup = 0, early_stopping = False, patience = 10,
               weighted = False,
-              tensorboard = False, savepath = "./", random_state=42, trial=None):
+              tensorboard = False, savepath = "./", random_state=42, trial=None,
+              nmi_eval_fn=None, nmi_eval_interval=5, nmi_eval_start=0):
         '''
         Train the model.
         Args:
@@ -216,13 +218,15 @@ class Integration:
                         self.model, self.epoch_num, self.batch_size,
                         self.num_batch, self.lr, accumulation_steps=self.accumulation_steps,
                         adaptlr=self.adaptlr, num_warmup=num_warmup, early_stopping=early_stopping,
-                        patience=patience, sample_weights=sample_weights, trial=trial)
+                        patience=patience, sample_weights=sample_weights, trial=trial,
+                        nmi_eval_fn=nmi_eval_fn, nmi_eval_interval=nmi_eval_interval, nmi_eval_start=nmi_eval_start)
         else:
             best_val_loss = train_model(self.device, self.writer, train_dataset, valid_dataset,
                         self.model, self.epoch_num, self.batch_size,
                         self.num_batch, self.lr, accumulation_steps = self.accumulation_steps,
                         adaptlr = self.adaptlr, num_warmup = num_warmup, early_stopping = early_stopping,
-                        patience = patience, trial=trial)
+                        patience = patience, trial=trial,
+                        nmi_eval_fn=nmi_eval_fn, nmi_eval_interval=nmi_eval_interval, nmi_eval_start=nmi_eval_start)
         if tensorboard:
             self.writer.close()
         print("Training finished!")

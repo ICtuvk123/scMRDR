@@ -3,6 +3,13 @@ from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
+import os
+
+
+def _get_num_workers():
+    # Sandbox/remote environments can block multiprocessing semaphores.
+    # Default to 0 for robustness; allow override via environment variable.
+    return int(os.getenv("SCMRDR_NUM_WORKERS", "0"))
 
 class EarlyStopping:
     '''
@@ -48,7 +55,7 @@ class EarlyStopping:
 
 def train_model(device, writer, train_dataset, validate_dataset, model, epoch_num, batch_size,
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
-                sample_weights=None, trial=None): #inferenceRNA, inferenceATAC,
+                sample_weights=None, trial=None, nmi_eval_fn=None, nmi_eval_interval=5, nmi_eval_start=0): #inferenceRNA, inferenceATAC,
     '''
     Train the model.
     Args:
@@ -68,6 +75,8 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         patience: patience for early stopping
         sample_weights: sample weights for weighted sampling
     '''
+    num_workers = _get_num_workers()
+
     # load data
     if sample_weights is not None:
         sample_weights = torch.tensor(sample_weights,dtype=torch.double)
@@ -76,13 +85,32 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
             num_samples=len(sample_weights),
             replacement=True
         )
-        train_data = DataLoader(train_dataset,batch_size,shuffle=False,sampler=sampler,drop_last=True,num_workers=4,pin_memory=True)
+        train_data = DataLoader(
+            train_dataset,
+            batch_size,
+            shuffle=False,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
     else:   
-        train_data = DataLoader(train_dataset,batch_size,shuffle=True,drop_last=True,num_workers=4,pin_memory=True)
+        train_data = DataLoader(
+            train_dataset,
+            batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
     # optimizer = optim.Adam(model.parameters(), lr=lr)
-    optimizer_gen = torch.optim.Adam(list(model.encoder_shared.parameters()) + 
-                                     list(model.encoder_specific.parameters()) + 
-                                     list(model.decoder.parameters()), lr=lr)
+    gen_params = (list(model.encoder_shared.parameters()) +
+                  list(model.encoder_specific.parameters()) +
+                  list(model.decoder.parameters()) +
+                  list(model.specific_modality_head.parameters()))
+    if model.batch_embed is not None:
+        gen_params += list(model.batch_embed.parameters())
+    optimizer_gen = torch.optim.Adam(gen_params, lr=lr)
     # FIX: Reduce Discriminator learning rate to prevent it from overpowering the Generator
     optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr * 0.1)
     if adaptlr==True:
@@ -96,8 +124,8 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
 
     for epoch in range(epoch_num):
         model.train()
-        total_loss,recon_loss,preserve_loss,adv_loss,total_discri_loss = \
-            0,0,0,0,0
+        total_loss,recon_loss,preserve_loss,adv_loss,total_discri_loss,total_sp_cls_loss = \
+            0,0,0,0,0,0
         for step, (X,b,m,i,w) in enumerate(train_data):
             X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
             X.requires_grad = True
@@ -125,12 +153,13 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 total_loss+=loss.item()
                 recon_loss+=loss_dict['recon_loss']
                 preserve_loss+=loss_dict['preserve_loss']
-                
-                # print(loss)
+                total_sp_cls_loss+=loss_dict['sp_cls_loss']
+
                 if writer is not None:
                     writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
                     writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
+                    writer.add_scalar("sp_cls_Loss/train", loss_dict['sp_cls_loss'], epoch*num_batch+step+1)
 
             elif epoch >= num_warmup:
                 ### === Phase A: Train Discriminator === ###
@@ -184,14 +213,15 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 preserve_loss+=loss_dict['preserve_loss']
                 adv_loss+=loss_dict['adv_loss']
                 total_discri_loss+=discri_loss.item()
-                
-                # print(loss)
+                total_sp_cls_loss+=loss_dict['sp_cls_loss']
+
                 if writer is not None:
                     writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
                     writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("adv_Loss/train", loss_dict['adv_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("discri_Loss/train", discri_loss.item(), epoch*num_batch+step+1)
+                    writer.add_scalar("sp_cls_Loss/train", loss_dict['sp_cls_loss'], epoch*num_batch+step+1)
             
         if writer is not None:    
             writer.add_scalar("Loss_epoch/train", total_loss / num_batch, epoch+1)
@@ -199,20 +229,23 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
             writer.add_scalar("preserve_Loss_epoch/train", preserve_loss / num_batch, epoch+1)
             writer.add_scalar("adv_Loss_epoch/train", adv_loss / num_batch, epoch+1)
             writer.add_scalar("discri_Loss_epoch/train", total_discri_loss / num_batch, epoch+1)
+            writer.add_scalar("sp_cls_Loss_epoch/train", total_sp_cls_loss / num_batch, epoch+1)
         
         if (epoch + 1) % 1 == 0:
-            print("epoch {}: loss = {:.4f}, Diff_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}, discri_loss = {:.4f}".format( # 
-                epoch+1,total_loss / num_batch, recon_loss / num_batch, preserve_loss / num_batch, adv_loss / num_batch, total_discri_loss / num_batch)) #
+            print("epoch {}: loss = {:.4f}, Diff_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}, discri_loss = {:.4f}, sp_cls = {:.4f}".format(
+                epoch+1,total_loss / num_batch, recon_loss / num_batch, preserve_loss / num_batch, adv_loss / num_batch, total_discri_loss / num_batch, total_sp_cls_loss / num_batch)) #
         
         if epoch >= num_warmup:
             if early_stopping:
                 validate_loss = validate_model(device, validate_dataset, model, batch_size)
-                # Optuna pruning support
-                if trial is not None:
-                    import optuna
-                    trial.report(validate_loss, epoch)
-                    if trial.should_prune():
-                        raise optuna.TrialPruned()
+                # Optuna pruning support (use NMI if provided)
+                if trial is not None and nmi_eval_fn is not None:
+                    if epoch >= nmi_eval_start and (epoch + 1) % nmi_eval_interval == 0:
+                        import optuna
+                        nmi = nmi_eval_fn()
+                        trial.report(nmi, epoch)
+                        if trial.should_prune():
+                            raise optuna.TrialPruned()
                 early_stopping(validate_loss, model)
                 if early_stopping.early_stop:
                     print(f"Early stopping at epoch {epoch+1}")
@@ -233,8 +266,16 @@ def validate_model(device, validate_dataset, model, batch_size):
         model: model to validate
         batch_size: batch size
     '''
+    num_workers = _get_num_workers()
     model.eval()
-    validate_data = DataLoader(validate_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
+    validate_data = DataLoader(
+        validate_dataset,
+        batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
     total_loss= 0
     num_batches = 0
     with torch.no_grad():
@@ -255,8 +296,16 @@ def inference_model(device, inference_dataset, model, batch_size):
         model: model to inference
         batch_size: batch size
     '''
+    num_workers = _get_num_workers()
     model.eval()
-    inference_data = DataLoader(inference_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
+    inference_data = DataLoader(
+        inference_dataset,
+        batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
     z1_list = []
     z2_list = []
     total_loss,recon_loss,preserve_loss,adv_loss= \

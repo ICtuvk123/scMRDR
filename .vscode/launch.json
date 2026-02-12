@@ -1,0 +1,101 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug optuna_search (coarse, 1 trial)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/optuna_search.py",
+      "args": [
+        "--phase",
+        "coarse",
+        "--target-total-trials",
+        "1"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Debug optuna_search (coarse, 1 trial, WITH DAG)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/optuna_search.py",
+      "args": [
+        "--phase",
+        "coarse",
+        "--target-total-trials",
+        "1",
+        "--use-causal-dag"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Debug optuna_search (refine, 1 trial)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/optuna_search.py",
+      "args": [
+        "--phase",
+        "refine",
+        "--lambda-low",
+        "0.02",
+        "--lambda-high",
+        "0.8",
+        "--target-total-trials",
+        "1"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Debug optuna_search (ablation4)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/optuna_search.py",
+      "args": [
+        "--ablation4",
+        "--ablation-epochs",
+        "120",
+        "--ablation-patience",
+        "20",
+        "--ablation-num-warmup",
+        "10",
+        "--ablation-lr",
+        "0.0008",
+        "--ablation-gamma",
+        "40",
+        "--ablation-lambda-adv",
+        "0.2",
+        "--ablation-dropout",
+        "0.22",
+        "--ablation-latent-dim",
+        "16",
+        "--ablation-batch-size",
+        "128",
+        "--ablation-denoise-hidden-dim",
+        "512",
+        "--ablation-seeds",
+        "3"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    }
+  ]
+}

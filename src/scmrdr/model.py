@@ -980,7 +980,8 @@ class EmbeddingNet(nn.Module):
     def __init__(self, device, input_dim, modality_num, covariate_dim = 1, celltype_num = 0,
                 layer_dims=[500,100], latent_dim_shared=20,
                 latent_dim_specific=20, dropout_rate = 0.5, gamma = 1, lambda_adv = 0.01,
-                feat_mask = None, distribution = "ZINB", # count_data = True, positive_outputs = True,
+                lambda_sp_cls = 1.0,
+                feat_mask = None, distribution = "ZINB",
                 encoder_covariates=False, eps=1e-10, use_causal_dag=False,
                 denoise_hidden_dim=None):
         super(EmbeddingNet, self).__init__()
@@ -1028,17 +1029,39 @@ class EmbeddingNet(nn.Module):
             self.register_buffer('causal_dag', causal_dag)
             self.register_buffer('inv_causal_dag', inv_causal_dag)
 
+        # 2-token context requires equal latent dimensions
+        assert latent_dim_shared == latent_dim_specific, \
+            "2-token context requires latent_dim_shared == latent_dim_specific"
+
         # Initialize Diffusion Model
         X_dim = input_dim+modality_num+covariate_dim*encoder_covariates+self.celltype_num
-        z_total_dim = latent_dim_shared + latent_dim_specific
         # Output dim: 3 parameters per gene (rho, disp, pi) + rest of the features
         denoise_out_dim = X_dim
-        self.Denoise_model = Denoise_net(X_dim, denoise_out_dim, hidden_dim=denoise_hidden_dim, context_dim=z_total_dim, out_act=None)
+        # 2-token context: each token has dim = latent_dim_shared (= latent_dim_specific)
+        self.Denoise_model = Denoise_net(X_dim, denoise_out_dim, hidden_dim=denoise_hidden_dim, context_dim=latent_dim_shared, out_act=None)
         diff_loss_type = "zinb" if self.distribution in ["ZINB", "NB"] else "l2"
         self.diffusion_model = ZINBDiffusion(self.Denoise_model, profile_size=X_dim, gene_num=input_dim, loss_type=diff_loss_type)
         self.decoder = self.diffusion_model
 
         self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)
+
+        # Batch embedding for CVAE-style batch conditioning in decoder
+        if covariate_dim > 0:
+            self.batch_embed = nn.Sequential(
+                nn.Linear(covariate_dim, latent_dim_shared),
+                nn.ReLU(),
+                nn.Linear(latent_dim_shared, latent_dim_shared)
+            )
+        else:
+            self.batch_embed = None
+
+        # Modality classification head on z_specific (Step 1)
+        self.lambda_sp_cls = lambda_sp_cls
+        self.specific_modality_head = nn.Sequential(
+            nn.Linear(latent_dim_specific, latent_dim_specific),
+            nn.ReLU(),
+            nn.Linear(latent_dim_specific, modality_num)
+        )
 
     def _apply_causal_dag(self, z_shared, z_specific):
         """
@@ -1092,8 +1115,12 @@ class EmbeddingNet(nn.Module):
             # Apply causal DAG: shared → specific
             z_shared, z_specific = self._apply_causal_dag(z_shared, z_specific)
 
-            z = torch.cat([z_shared, z_specific], dim=-1)
-            z_context = z.unsqueeze(1)
+            # Build context tokens: [z_shared, z_specific, (z_batch)]
+            context_tokens = [z_shared, z_specific]
+            if self.batch_embed is not None:
+                z_batch = self.batch_embed(b)  # (B, latent_dim)
+                context_tokens.append(z_batch)
+            z_context = torch.stack(context_tokens, dim=1)  # (B, 2or3, latent_dim)
 
             diff_inputs = [x, m]
             if self.encoder_covariates:
@@ -1103,35 +1130,28 @@ class EmbeddingNet(nn.Module):
             sample_mask = i @ self.feat_mask  # (batch, input_dim)
             diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context, mask=sample_mask)
 
-            # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
             preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
-            # preserve_loss = sammon_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
-            # preserve_loss = laplacian_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
-            # preserve_loss = frobenius_isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
-            # preserve_loss = knn_structure_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)
-            #z_per_class = [z_shared[m[:, i].bool()] for i in range(m.shape[1])]
-            #align_loss = torch.stack([MMD(z_per_class[0], z_per_class[i]) for i in range(1, len(z_per_class))]).sum()
 
-            # modality_labels = torch.argmax(m, dim=1)
-            modality_logits_adv = self.discriminator(z_shared)  # gradients allowed here
-            
-            # FIX: Use Entropy Maximization instead of negative CrossEntropy to prevent unbounded loss collapse
+            modality_labels = torch.argmax(m, dim=1)
+
+            # Adversarial: push modality info OUT of z_shared
+            modality_logits_adv = self.discriminator(z_shared)
             probs = F.softmax(modality_logits_adv, dim=1)
             log_probs = F.log_softmax(modality_logits_adv, dim=1)
             entropy = -(probs * log_probs).sum(dim=1).mean()
-            adv_loss = -entropy # Minimize -entropy -> Maximize entropy (confusion)
+            adv_loss = -entropy
 
-            # z_shared_detached = z_shared.clone().detach()
-            # modality_logits = self.discriminator(z_shared_detached) #
-            # discri_loss = F.cross_entropy(modality_logits, modality_labels, reduction='sum')/m.shape[0]
+            # Classification: push modality info INTO z_specific
+            sp_modality_logits = self.specific_modality_head(z_specific)
+            sp_cls_loss = F.cross_entropy(sp_modality_logits, modality_labels)
 
-                
-            total_loss = diffusion_loss + self.gamma * preserve_loss + self.lambda_adv * adv_loss # + align_loss
-            loss_dict = {'total_loss':total_loss.item(), 
+            total_loss = diffusion_loss + self.gamma * preserve_loss + self.lambda_adv * adv_loss + self.lambda_sp_cls * sp_cls_loss
+            loss_dict = {'total_loss':total_loss.item(),
                         'diffusion_loss':diffusion_loss.item(), 'recon_loss':diffusion_loss.item(),
-                        'preserve_loss': preserve_loss.item(), #,'align_loss':align_loss.item()
-                        'adv_loss': adv_loss.item()
-                        } 
+                        'preserve_loss': preserve_loss.item(),
+                        'adv_loss': adv_loss.item(),
+                        'sp_cls_loss': sp_cls_loss.item()
+                        }
             return z_shared, z_specific, total_loss, loss_dict
         elif stage=="discriminator":
             if self.count_data:
@@ -1165,8 +1185,12 @@ class EmbeddingNet(nn.Module):
             # Apply causal DAG: shared → specific
             z_shared, z_specific = self._apply_causal_dag(z_shared, z_specific)
 
-            z = torch.cat([z_shared, z_specific], dim=-1)
-            z_context = z.unsqueeze(1)
+            # Build context tokens: [z_shared, z_specific, (z_batch)]
+            context_tokens = [z_shared, z_specific]
+            if self.batch_embed is not None:
+                z_batch = self.batch_embed(b)  # (B, latent_dim)
+                context_tokens.append(z_batch)
+            z_context = torch.stack(context_tokens, dim=1)  # (B, 2or3, latent_dim)
 
             diff_inputs = [x, m]
             if self.encoder_covariates:
@@ -1176,15 +1200,19 @@ class EmbeddingNet(nn.Module):
             sample_mask = i @ self.feat_mask  # (batch, input_dim)
             diffusion_loss = self.diffusion_model(torch.cat(diff_inputs,dim=-1), embeddings=z_context, mask=sample_mask)
 
-            # loss
             preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
-            # hsic = 1000 * HSICloss(z_shared,m)
-            total_loss = diffusion_loss + self.gamma * preserve_loss #+ hsic
+
+            # Classification: push modality info INTO z_specific
+            modality_labels = torch.argmax(m, dim=1)
+            sp_modality_logits = self.specific_modality_head(z_specific)
+            sp_cls_loss = F.cross_entropy(sp_modality_logits, modality_labels)
+
+            total_loss = diffusion_loss + self.gamma * preserve_loss + self.lambda_sp_cls * sp_cls_loss
             loss_dict = {'diffusion_loss':diffusion_loss.item(), 'recon_loss':diffusion_loss.item(),
                         'preserve_loss': preserve_loss.item(),
-                        # 'hsic': hsic.item(),
+                        'sp_cls_loss': sp_cls_loss.item(),
                         'total_loss':total_loss.item()
-                        } 
+                        }
             return z_shared, z_specific, total_loss, loss_dict
     
 
