@@ -376,7 +376,7 @@ class EmbeddingNet(nn.Module):
                                     nn.Linear(10, 2))
         self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)   
     
-    def forward(self,x,b,m,i,w,stage="vae"):
+    def forward(self,x,b,m,i,w,stage="vae",return_adv_components=False):
         '''
         Forward pass through the embedding network.
         Args:
@@ -452,20 +452,29 @@ class EmbeddingNet(nn.Module):
 
             modality_labels = torch.argmax(m, dim=1)
             modality_logits_adv = self.discriminator(z_shared)  # gradients allowed here
-            adv_loss = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='sum')/m.shape[0]
 
-            # z_shared_detached = z_shared.clone().detach()
-            # modality_logits = self.discriminator(z_shared_detached) #
-            # discri_loss = F.cross_entropy(modality_logits, modality_labels, reduction='sum')/m.shape[0]
-
-                
-            total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss + self.lambda_adv * adv_loss # + align_loss
-            loss_dict = {'total_loss':total_loss.item(), 
-                        'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
-                        'preserve_loss': preserve_loss.item(), #,'align_loss':align_loss.item()
-                        'adv_loss': adv_loss.item()
-                        } 
-            return mu_shared, mu_specific, total_loss, loss_dict
+            if return_adv_components:
+                per_sample_adv = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='none')  # (B,)
+                adv_loss_scalar = per_sample_adv.sum() / m.shape[0]
+                base_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss
+                loss_dict = {'total_loss': (base_loss + self.lambda_adv * adv_loss_scalar).item(),
+                            'recon_loss': recon_loss.item(), 'kl_z': kl_z.item(),
+                            'preserve_loss': preserve_loss.item(),
+                            'adv_loss': adv_loss_scalar.item(),
+                            '_z_shared': z_shared,
+                            '_modality_logits': modality_logits_adv,
+                            '_per_sample_adv': per_sample_adv,
+                            }
+                return mu_shared, mu_specific, base_loss, loss_dict
+            else:
+                adv_loss = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='sum')/m.shape[0]
+                total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss + self.lambda_adv * adv_loss
+                loss_dict = {'total_loss':total_loss.item(),
+                            'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
+                            'preserve_loss': preserve_loss.item(),
+                            'adv_loss': adv_loss.item()
+                            }
+                return mu_shared, mu_specific, total_loss, loss_dict
         elif stage=="discriminator":
             x_original = x
             if self.count_data:
@@ -526,8 +535,9 @@ class EmbeddingNet(nn.Module):
             loss_dict = {'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
                         'preserve_loss': preserve_loss.item(),
                         # 'hsic': hsic.item(),
-                        'total_loss':total_loss.item()
-                        } 
+                        'total_loss':total_loss.item(),
+                        '_z_shared': z_shared,
+                        }
             return mu_shared, mu_specific, total_loss, loss_dict
     
     def sample_sequencing_depth(self, x, strategy="observed"):

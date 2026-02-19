@@ -44,9 +44,14 @@ class EarlyStopping:
         # if self.verbose:
         #     print(f"Validation loss decreased, model saved to {self.path}")
 
-def train_model(device, writer, train_dataset, validate_dataset, model, epoch_num, batch_size, 
+def train_model(device, writer, train_dataset, validate_dataset, model, epoch_num, batch_size,
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
-                sample_weights=None): #inferenceRNA, inferenceATAC, 
+                sample_weights=None,
+                confidence_weighted=False,
+                cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
+                cw_tau_min=0.01, cw_tau_max=2.0, cw_tau_fallback=0.5,
+                cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
+                cw_min_count=8, cw_adv_ramp_epochs=10, cw_lambda_target=None):
     '''
     Train the model.
     Args:
@@ -65,6 +70,8 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         early_stopping: whether to use early stopping
         patience: patience for early stopping
         sample_weights: sample weights for weighted sampling
+        confidence_weighted: whether to use confidence-weighted adversarial training
+        cw_*: confidence weighting hyperparameters
     '''
     # load data
     if sample_weights is not None:
@@ -90,7 +97,25 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                                                             T_max =  epoch_num * num_batch)
     
     if early_stopping:
-        early_stopping = EarlyStopping(patience=patience, verbose=True)   
+        early_stopping = EarlyStopping(patience=patience, verbose=True)
+
+    # Confidence-weighted adversarial training setup
+    cw = None
+    if confidence_weighted:
+        from .confidence import ConfidenceWeighter
+        cw = ConfidenceWeighter(
+            latent_dim=model.latent_dim_shared,
+            num_modalities=model.modality_num,
+            device=device,
+            queue_size=cw_queue_size, alpha=cw_alpha,
+            c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
+            tau_fallback=cw_tau_fallback, eta=cw_eta,
+            rho=cw_rho, tau_w=cw_tau_w, w_min=cw_w_min,
+            min_count=cw_min_count,
+        )
+        lambda_target = cw_lambda_target if cw_lambda_target is not None else model.lambda_adv
+        T_w = num_warmup
+        T_r = cw_adv_ramp_epochs
 
     for epoch in range(epoch_num):
         model.train()
@@ -110,21 +135,26 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 model.train()
                 _, _, loss, loss_dict = model(X,b,m,i,w,stage="warmup")
                 # with torch.autograd.detect_anomaly():
-                loss.backward() 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1) 
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                 if (step + 1) % accumulation_steps == 0:
                     optimizer_vae.step()
-                    optimizer_vae.zero_grad()      
+                    optimizer_vae.zero_grad()
                 if (writer is not None) & (adaptlr == True):
                     writer.add_scalar("lr_vae/train",scheduler_vae.get_last_lr()[0],epoch*num_batch+step)
-                if adaptlr == True:    
+                if adaptlr == True:
                     scheduler_vae.step()
-                
+
+                # Update confidence weighter queues during warmup
+                if cw is not None and '_z_shared' in loss_dict:
+                    modality_labels_batch = torch.argmax(m, dim=1)
+                    cw.update_queues(loss_dict['_z_shared'].detach(), modality_labels_batch)
+
                 total_loss+=loss.item()
                 recon_loss+=loss_dict['recon_loss']
                 kl_z+=loss_dict['kl_z']
                 preserve_loss+=loss_dict['preserve_loss']
-                
+
                 # print(loss)
                 if writer is not None:
                     writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
@@ -151,33 +181,81 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 ### === Phase B: Train VAE, fool Discriminator === ###
                 model.train()
                 model.discriminator.eval()
-                _, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")
-                # with torch.autograd.detect_anomaly():
-                loss.backward() 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1) 
-                if (step + 1) % accumulation_steps == 0:
-                    optimizer_vae.step()
-                    optimizer_vae.zero_grad()      
+
+                if cw is not None:
+                    # Confidence-weighted adversarial training
+                    _, _, base_loss, loss_dict = model(X,b,m,i,w,stage="vae",return_adv_components=True)
+
+                    z_shared_batch = loss_dict['_z_shared']
+                    logits_batch = loss_dict['_modality_logits']
+                    per_sample_adv = loss_dict['_per_sample_adv']
+                    modality_labels_batch = torch.argmax(m, dim=1)
+
+                    adv_weights = cw.compute_weights(z_shared_batch, modality_labels_batch, logits_batch)
+                    cw.update_queues(z_shared_batch.detach(), modality_labels_batch)
+
+                    # Lambda ramp
+                    ramp = min(1.0, max(0.0, (epoch - T_w) / T_r)) if T_r > 0 else 1.0
+                    lambda_adv_current = lambda_target * ramp
+
+                    adv_loss_weighted = (adv_weights * per_sample_adv).sum() / m.shape[0]
+                    loss = base_loss + lambda_adv_current * adv_loss_weighted
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+                    if (step + 1) % accumulation_steps == 0:
+                        optimizer_vae.step()
+                        optimizer_vae.zero_grad()
+
+                    # Logging
+                    loss_dict_adv_val = adv_loss_weighted.item()
+                    total_loss += loss.item()
+                    recon_loss += loss_dict['recon_loss']
+                    kl_z += loss_dict['kl_z']
+                    preserve_loss += loss_dict['preserve_loss']
+                    adv_loss += loss_dict_adv_val
+                    total_discri_loss += discri_loss.item()
+
+                    if writer is not None:
+                        global_step = epoch * num_batch + step + 1
+                        writer.add_scalar("Loss/train", loss.item(), global_step)
+                        writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], global_step)
+                        writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], global_step)
+                        writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], global_step)
+                        writer.add_scalar("adv_Loss/train", loss_dict_adv_val, global_step)
+                        writer.add_scalar("discri_Loss/train", discri_loss.item(), global_step)
+                        writer.add_scalar("lambda_adv/train", lambda_adv_current, global_step)
+                        writer.add_scalar("mean_adv_weight/train", adv_weights.mean().item(), global_step)
+                        writer.add_scalar("min_adv_weight/train", adv_weights.min().item(), global_step)
+                        writer.add_scalar("tau_nn/train", cw.current_tau_nn, global_step)
+                else:
+                    # Original adversarial training (no confidence weighting)
+                    _, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+                    if (step + 1) % accumulation_steps == 0:
+                        optimizer_vae.step()
+                        optimizer_vae.zero_grad()
+
+                    total_loss+=loss.item()
+                    recon_loss+=loss_dict['recon_loss']
+                    kl_z+=loss_dict['kl_z']
+                    preserve_loss+=loss_dict['preserve_loss']
+                    adv_loss+=loss_dict['adv_loss']
+                    total_discri_loss+=discri_loss.item()
+
+                    if writer is not None:
+                        writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
+                        writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
+                        writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], epoch*num_batch+step+1)
+                        writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
+                        writer.add_scalar("adv_Loss/train", loss_dict['adv_loss'], epoch*num_batch+step+1)
+                        writer.add_scalar("discri_Loss/train", discri_loss.item(), epoch*num_batch+step+1)
+
                 if (writer is not None) & (adaptlr == True):
                     writer.add_scalar("lr_vae/train",scheduler_vae.get_last_lr()[0],epoch*num_batch+step)
-                if adaptlr == True:    
+                if adaptlr == True:
                     scheduler_vae.step()
-                
-                total_loss+=loss.item()
-                recon_loss+=loss_dict['recon_loss']
-                kl_z+=loss_dict['kl_z']
-                preserve_loss+=loss_dict['preserve_loss']
-                adv_loss+=loss_dict['adv_loss']
-                total_discri_loss+=discri_loss.item()
-                
-                # print(loss)
-                if writer is not None:
-                    writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
-                    writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
-                    writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], epoch*num_batch+step+1)
-                    writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
-                    writer.add_scalar("adv_Loss/train", loss_dict['adv_loss'], epoch*num_batch+step+1)
-                    writer.add_scalar("discri_Loss/train", discri_loss.item(), epoch*num_batch+step+1)
             
         if writer is not None:    
             writer.add_scalar("Loss_epoch/train", total_loss / num_batch, epoch+1)

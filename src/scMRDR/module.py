@@ -127,8 +127,13 @@ class Integration:
         else:
             raise ValueError("Distribution not recognized!")
 
-    def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5, 
-              beta = 2, gamma = 1, lambda_adv = 0.01, device=None):
+    def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
+              beta = 2, gamma = 1, lambda_adv = 0.01, device=None,
+              confidence_weighted=False,
+              cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
+              cw_tau_range=(0.01, 2.0), cw_tau_fallback=0.5,
+              cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
+              cw_min_count=8):
         '''
         Setup the model.
         Args:
@@ -140,6 +145,17 @@ class Integration:
             gamma: float, gamma parameter for the gamma distribution
             lambda_adv: float, lambda parameter for the adversarial loss
             device: device to train the model. Default is None, indicating GPU will be used if available.
+            confidence_weighted: bool, whether to use confidence-weighted adversarial training
+            cw_queue_size: int, per-modality FIFO queue capacity
+            cw_alpha: float, fusion weight s = alpha*s_H + (1-alpha)*s_nn
+            cw_c_tau: float, adaptive tau_nn multiplier
+            cw_tau_range: tuple, (tau_min, tau_max) clipping range for tau_nn
+            cw_tau_fallback: float, EMA fallback tau value
+            cw_eta: float, tau_nn EMA decay coefficient
+            cw_rho: float, budget quantile ratio
+            cw_tau_w: float, gating sigmoid temperature
+            cw_w_min: float, minimum weight floor
+            cw_min_count: int, minimum per-modality sample count for threshold
         '''
         self.input_dim = self.data.shape[1]
         self.hidden_layers = hidden_layers
@@ -155,22 +171,32 @@ class Integration:
         else:
             self.device = device
         print("using "+str(self.device))
-        self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers, 
-                    latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate, 
+        self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers,
+                    latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate,
                     beta=self.beta, gamma = self.gamma, lambda_adv = self.lambda_adv,
                     feat_mask = self.feat_mask, distribution = self.distribution).to(self.device)
         self.train_dataset = CombinedDataset(self.data,self.covariates,self.modality,self.mask, self.celltype)
+
+        self.confidence_weighted = confidence_weighted
+        self.cw_params = dict(
+            cw_queue_size=cw_queue_size, cw_alpha=cw_alpha, cw_c_tau=cw_c_tau,
+            cw_tau_min=cw_tau_range[0], cw_tau_max=cw_tau_range[1],
+            cw_tau_fallback=cw_tau_fallback, cw_eta=cw_eta,
+            cw_rho=cw_rho, cw_tau_w=cw_tau_w, cw_w_min=cw_w_min,
+            cw_min_count=cw_min_count,
+        )
     
-    def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1, 
+    def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1,
               adaptlr = False, valid_prop = 0.1, num_warmup = 0, early_stopping = True, patience = 10,
               weighted = False,
-              tensorboard = False, savepath = "./", random_state=42):
+              tensorboard = False, savepath = "./", random_state=42,
+              cw_adv_ramp_epochs=10, cw_lambda_target=None):
         '''
         Train the model.
         Args:
             epoch_num: int, number of epochs
             batch_size: int, batch size
-            lr: float, learning rate    
+            lr: float, learning rate
             accumulation_steps: int, number of steps to accumulate gradients
             adaptlr: bool, whether to adapt learning rate
             valid_prop: float, proportion of data to use for validation
@@ -181,6 +207,8 @@ class Integration:
             tensorboard: bool, whether to use tensorboard
             savepath: str, path to save the tensorboard logs
             random_state: int, random seed
+            cw_adv_ramp_epochs: int, number of epochs for lambda_adv to ramp from 0 to target
+            cw_lambda_target: float, target lambda_adv value (None uses model's lambda_adv)
         '''
         if tensorboard:
             print("Using tensorboard!")
@@ -206,6 +234,12 @@ class Integration:
         self.num_batch = len(train_dataset)//self.batch_size
         
         print("Training start!")
+        cw_kwargs = dict(
+            confidence_weighted=self.confidence_weighted,
+            cw_adv_ramp_epochs=cw_adv_ramp_epochs,
+            cw_lambda_target=cw_lambda_target,
+            **self.cw_params,
+        )
         if weighted:
             weights = 1.0 / np.bincount(self.modality.argmax(-1))
             sample_weights = weights[self.modality.argmax(-1)]
@@ -214,13 +248,15 @@ class Integration:
                         self.model, self.epoch_num, self.batch_size,
                         self.num_batch, self.lr, accumulation_steps=self.accumulation_steps,
                         adaptlr=self.adaptlr, num_warmup=num_warmup, early_stopping=early_stopping,
-                        patience=patience, sample_weights=sample_weights)
+                        patience=patience, sample_weights=sample_weights,
+                        **cw_kwargs)
         else:
             train_model(self.device, self.writer, train_dataset, valid_dataset,
-                        self.model, self.epoch_num, self.batch_size, 
-                        self.num_batch, self.lr, accumulation_steps = self.accumulation_steps, 
+                        self.model, self.epoch_num, self.batch_size,
+                        self.num_batch, self.lr, accumulation_steps = self.accumulation_steps,
                         adaptlr = self.adaptlr, num_warmup = num_warmup, early_stopping = early_stopping,
-                        patience = patience)
+                        patience = patience,
+                        **cw_kwargs)
         if tensorboard:
             self.writer.close()
         print("Training finished!")
