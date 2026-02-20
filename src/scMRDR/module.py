@@ -130,7 +130,7 @@ class Integration:
     def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
               beta = 2, gamma = 1, lambda_adv = 0.01, device=None,
               confidence_weighted=False,
-              cw_w_floor=0.3, cw_w_cap=1.0, cw_tau=1.0,
+              cw_w_floor=0.6, cw_w_cap=1.0, cw_tau=1.0,
               cw_ema_decay=0.99, cw_stats_warmup_steps=50):
         '''
         Setup the model.

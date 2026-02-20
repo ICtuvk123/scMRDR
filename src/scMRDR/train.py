@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 from torch import optim
@@ -48,7 +49,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
                 sample_weights=None,
                 confidence_weighted=False,
-                cw_w_floor=0.3, cw_w_cap=1.0, cw_tau=1.0,
+                cw_w_floor=0.6, cw_w_cap=1.0, cw_tau=1.0,
                 cw_ema_decay=0.99, cw_stats_warmup_steps=50,
                 cw_adv_ramp_epochs=10, cw_lambda_target=None):
     '''
@@ -190,7 +191,11 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                     ramp = min(1.0, max(0.0, (epoch - T_w) / T_r)) if T_r > 0 else 1.0
                     lambda_adv_current = lambda_target * ramp
 
-                    # 不做权重均值归一化（总对抗压力可降低）
+                    # 自适应 λ：判别器被击败时（discri_loss > ln(K)）按比例衰减
+                    random_ce = math.log(m.shape[1])
+                    adv_scale = min(1.0, random_ce / (discri_loss.item() + 1e-8))
+                    lambda_adv_current = lambda_adv_current * adv_scale
+
                     adv_loss_weighted = (adv_weights * per_sample_adv).sum() / B
                     loss = base_loss + lambda_adv_current * adv_loss_weighted
 
@@ -218,6 +223,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                         writer.add_scalar("adv_Loss/train", loss_dict_adv_val, global_step)
                         writer.add_scalar("discri_Loss/train", discri_loss.item(), global_step)
                         writer.add_scalar("lambda_adv/train", lambda_adv_current, global_step)
+                        writer.add_scalar("adv_scale/train", adv_scale, global_step)
                         writer.add_scalar("mean_adv_weight/train", adv_weights.mean().item(), global_step)
                         writer.add_scalar("min_adv_weight/train", adv_weights.min().item(), global_step)
                 else:

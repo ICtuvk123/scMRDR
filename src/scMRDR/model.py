@@ -376,7 +376,25 @@ class EmbeddingNet(nn.Module):
                                     nn.Linear(10, 2))
         self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)   
     
-    def forward(self,x,b,m,i,w,stage="vae",return_adv_components=False):
+    def encode_shared_mu(self, x_raw, b=None, w=None):
+        """Get deterministic mu_shared from raw input (handles log1p internally).
+
+        Used by ConsistencyGating to measure z_shared stability.
+        """
+        x = torch.log1p(x_raw) if self.count_data else x_raw
+        if self.celltype_num == 0:
+            if self.encoder_covariates and b is not None:
+                _, mu, _ = self.encoder_shared(torch.cat([x, b], dim=-1))
+            else:
+                _, mu, _ = self.encoder_shared(x)
+        else:
+            if self.encoder_covariates and b is not None:
+                _, mu, _ = self.encoder_shared(torch.cat([x, b, w], dim=-1))
+            else:
+                _, mu, _ = self.encoder_shared(torch.cat([x, w], dim=-1))
+        return mu
+
+    def forward(self,x,b,m,i,w,stage="vae",return_adv_components=False,preserve_weights=None):
         '''
         Forward pass through the embedding network.
         Args:
@@ -441,7 +459,8 @@ class EmbeddingNet(nn.Module):
             kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
                 klLoss(mu_shared, logvar_shared)
             # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
-            preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)
+            preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m,
+                                           sample_weights=preserve_weights)
             # preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # preserve_loss = sammon_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
             # preserve_loss = laplacian_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
@@ -538,7 +557,8 @@ class EmbeddingNet(nn.Module):
                 recon_loss = mseLoss(x_original, rho, mask)
             kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
                 klLoss(mu_shared, logvar_shared)
-            preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)  
+            preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m,
+                                           sample_weights=preserve_weights)
             # hsic = 1000 * HSICloss(z_shared,m)
             total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss #+ hsic
             loss_dict = {'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),

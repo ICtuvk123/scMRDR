@@ -118,7 +118,7 @@ def klLoss_prior(mu_q, logvar_q, mu_p, logvar_p):
 
 
 # structure preserve
-def isometric_loss(X, X_prime, m, p=2):
+def isometric_loss(X, X_prime, m, p=2, sample_weights=None):
     """
     Compute Isometric Loss while preserving the structure within each class separately.
 
@@ -127,23 +127,27 @@ def isometric_loss(X, X_prime, m, p=2):
         X_prime: Feature matrix in the latent space (batch_size, latent_dim)
         m: One-hot encoded class labels (batch_size, num_classes)
         p: Norm type for distance computation (default: Euclidean distance, p=2)
+        sample_weights: Optional (batch_size,) per-sample weights.
+            Each pair (i,j) is weighted by w_i * w_j.
 
     Returns:
         loss: Isometric Loss (Mean Squared Error between pairwise distances within each class)
     """
-    # X = X.detach()
-    
     # Compute pairwise distance matrices using PyTorch's cdist
     D_X = torch.cdist(X, X, p=p)  # Distance matrix in original space
     D_X_prime = torch.cdist(X_prime, X_prime, p=p)  # Distance matrix in latent space
 
     # Convert one-hot class labels to class similarity mask
     mask = (m @ m.T).float()  # (batch_size, batch_size), 1 for same class, 0 otherwise
-    
-    D_X = D_X * mask
-    D_X_prime = D_X_prime * mask
 
-    # Compute MSE loss only for distances within the same class
-    loss = F.mse_loss(D_X_prime, D_X, reduction='sum') / X.shape[0] # Element-wise masking
+    diff_sq = (D_X_prime - D_X).pow(2)
+
+    if sample_weights is not None:
+        # Weight pair (i,j) by w_i * w_j
+        W = sample_weights.unsqueeze(0) * sample_weights.unsqueeze(1)
+        loss = (diff_sq * mask * W).sum() / X.shape[0]
+    else:
+        loss = (diff_sq * mask).sum() / X.shape[0]
+
     return loss
 

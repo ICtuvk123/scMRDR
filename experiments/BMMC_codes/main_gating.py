@@ -60,7 +60,7 @@ model.setup(
     # ── Recon Gating 参数 ──────────
     confidence_weighted=True,
 
-    cw_w_floor=0.3,             # 最低对抗权重（防止 iLISI 崩溃）
+    cw_w_floor=0.6,             # 最低对抗权重（防止 iLISI 崩溃）
     cw_w_cap=1.0,               # 最高对抗权重
     cw_tau=1.0,                 # sigmoid 温度
     cw_ema_decay=0.99,          # EMA 衰减系数
