@@ -24,21 +24,21 @@ class ZINBLoss(nn.Module):
     def __init__(self):
         super(ZINBLoss, self).__init__()
 
-    def forward(self, x, rho, dispersion, pi, s, mask=None, eps=1e-8):
+    def forward(self, x, rho, dispersion, pi, s, mask=None, eps=1e-8, reduction='mean'):
         # P_NB(x; mu,r) = Gamma(x+r)/[Gamma(r)Gamma(x+1)] * [r/(r+mu)]^r * [mu/(r+mu)]^x
         # logP_NB(x) = logGamma(x+r) - logGamma(r) - logGamma(x+1) + rlog(r) - rlog(r+mu) + xlog(mu) - xlog(r+mu)
         # -logP_NB(x) = [-logGamma(x+r) + logGamma(r) + logGamma(x+1)] + [- rlog(r) - xlog(mu) + (r+x)log(r+mu)]
-        
+
         mean = torch.clamp(rho * s, min=eps)
         dispersion = torch.clamp(dispersion, min=eps)
 
         # negative likelihood of NB
         # t1 = -logGamma(x+r) + logGamma(r) + logGamma(x+1)
-        t1 = torch.lgamma(dispersion) + torch.lgamma(x + 1.0) - torch.lgamma(x + dispersion) 
+        t1 = torch.lgamma(dispersion) + torch.lgamma(x + 1.0) - torch.lgamma(x + dispersion)
         # t2 = - rlog(r) - xlog(mu) + (r+x)log(r+mu)
         t2 = -dispersion * torch.log(dispersion) - x * torch.log(mean) + (dispersion + x) * torch.log(dispersion + mean)
         nb_final = t1 + t2
-        
+
         # zero-inflation
         zero_nb = torch.exp(dispersion * (torch.log(dispersion) - torch.log(dispersion + mean)))  # P_{NB}(x=0) = [r/(r+mu)]^r = exp{r[log(r)-log(r+mu)]}
         # zero_nb = torch.pow(dispersion / (dispersion + mean), dispersion)  # P_{NB}(x=0)
@@ -47,28 +47,33 @@ class ZINBLoss(nn.Module):
 
         loss = torch.where(x <= eps, zero_case, nb_case)
         if mask is not None:
-            mean_loss = torch.mean(torch.sum(loss * mask,dim=1)*(x.shape[1]/torch.sum(mask, dim=1)),dim=0) #
+            per_sample = torch.sum(loss * mask, dim=1) * (x.shape[1] / torch.sum(mask, dim=1))
         else:
-            mean_loss = torch.mean(torch.sum(loss,dim=1),dim=0)
-        return mean_loss
+            per_sample = torch.sum(loss, dim=1)
+        if reduction == 'none':
+            return per_sample  # (B,)
+        return torch.mean(per_sample, dim=0)
 
 
-def mseLoss(x,y,mask=None):
+def mseLoss(x, y, mask=None, reduction='mean'):
     """
     Mean Squared Error Loss
     Args:
         x: predicted values (batch_size, num_features)
         y: target values (batch_size, num_features)
         mask: optional mask to ignore certain elements in the loss computation (batch_size, num_features)
+        reduction: 'mean' (default, scalar) or 'none' (per-sample, (B,))
     Returns:
         mean_loss: mean squared error loss across the batch
     """
     loss = (x-y).pow(2)
     if mask is not None:
-        mean_loss = torch.mean(torch.sum(loss * mask,dim=1)*(x.shape[1]/torch.sum(mask, dim=1)),dim=0) #
+        per_sample = torch.sum(loss * mask, dim=1) * (x.shape[1] / torch.sum(mask, dim=1))
     else:
-        mean_loss = torch.mean(torch.sum(loss,dim=1),dim=0)
-    return mean_loss # torch.mean(torch.sum(loss,dim=1),dim=0)
+        per_sample = torch.sum(loss, dim=1)
+    if reduction == 'none':
+        return per_sample  # (B,)
+    return torch.mean(per_sample, dim=0)
     
 
 def klLoss(mu, logvar):

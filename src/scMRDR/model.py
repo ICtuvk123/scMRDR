@@ -457,6 +457,14 @@ class EmbeddingNet(nn.Module):
                 per_sample_adv = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='none')  # (B,)
                 adv_loss_scalar = per_sample_adv.sum() / m.shape[0]
                 base_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss
+
+                # Per-sample recon loss for ReconGating (reduction='none')
+                zinb_loss_ps = ZINBLoss()
+                if self.count_data:
+                    per_sample_recon = zinb_loss_ps(x_original, rho, dispersion, pi, s, mask, eps=self.eps, reduction='none')
+                else:
+                    per_sample_recon = mseLoss(x_original, rho, mask, reduction='none')
+
                 loss_dict = {'total_loss': (base_loss + self.lambda_adv * adv_loss_scalar).item(),
                             'recon_loss': recon_loss.item(), 'kl_z': kl_z.item(),
                             'preserve_loss': preserve_loss.item(),
@@ -464,6 +472,7 @@ class EmbeddingNet(nn.Module):
                             '_z_shared': z_shared,
                             '_modality_logits': modality_logits_adv,
                             '_per_sample_adv': per_sample_adv,
+                            '_per_sample_recon': per_sample_recon,
                             }
                 return mu_shared, mu_specific, base_loss, loss_dict
             else:

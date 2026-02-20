@@ -48,10 +48,9 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
                 sample_weights=None,
                 confidence_weighted=False,
-                cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
-                cw_tau_min=0.01, cw_tau_max=2.0, cw_tau_fallback=0.5,
-                cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
-                cw_min_count=8, cw_adv_ramp_epochs=10, cw_lambda_target=None):
+                cw_w_floor=0.3, cw_w_cap=1.0, cw_tau=1.0,
+                cw_ema_decay=0.99, cw_stats_warmup_steps=50,
+                cw_adv_ramp_epochs=10, cw_lambda_target=None):
     '''
     Train the model.
     Args:
@@ -70,8 +69,14 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         early_stopping: whether to use early stopping
         patience: patience for early stopping
         sample_weights: sample weights for weighted sampling
-        confidence_weighted: whether to use confidence-weighted adversarial training
-        cw_*: confidence weighting hyperparameters
+        confidence_weighted: whether to use recon-gated adversarial training
+        cw_w_floor: minimum adversarial weight floor
+        cw_w_cap: maximum adversarial weight cap
+        cw_tau: sigmoid temperature for gating
+        cw_ema_decay: EMA decay for running statistics
+        cw_stats_warmup_steps: steps to collect stats before gating starts
+        cw_adv_ramp_epochs: epochs for lambda_adv ramp-up
+        cw_lambda_target: target lambda_adv (None uses model's lambda_adv)
     '''
     # load data
     if sample_weights is not None:
@@ -99,19 +104,13 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
     if early_stopping:
         early_stopping = EarlyStopping(patience=patience, verbose=True)
 
-    # Confidence-weighted adversarial training setup
-    cw = None
+    # Recon-gated adversarial training setup
+    rg = None
     if confidence_weighted:
-        from .confidence import ConfidenceWeighter
-        cw = ConfidenceWeighter(
-            latent_dim=model.latent_dim_shared,
-            num_modalities=model.modality_num,
-            device=device,
-            queue_size=cw_queue_size, alpha=cw_alpha,
-            c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
-            tau_fallback=cw_tau_fallback, eta=cw_eta,
-            rho=cw_rho, tau_w=cw_tau_w, w_min=cw_w_min,
-            min_count=cw_min_count,
+        from .confidence import ReconGating
+        rg = ReconGating(
+            w_floor=cw_w_floor, w_cap=cw_w_cap, tau=cw_tau,
+            ema_decay=cw_ema_decay, stats_warmup_steps=cw_stats_warmup_steps,
         )
         lambda_target = cw_lambda_target if cw_lambda_target is not None else model.lambda_adv
         T_w = num_warmup
@@ -145,11 +144,6 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 if adaptlr == True:
                     scheduler_vae.step()
 
-                # Update confidence weighter queues during warmup
-                if cw is not None and '_z_shared' in loss_dict:
-                    modality_labels_batch = torch.argmax(m, dim=1)
-                    cw.update_queues(loss_dict['_z_shared'].detach(), modality_labels_batch)
-
                 total_loss+=loss.item()
                 recon_loss+=loss_dict['recon_loss']
                 kl_z+=loss_dict['kl_z']
@@ -182,23 +176,22 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 model.train()
                 model.discriminator.eval()
 
-                if cw is not None:
-                    # Confidence-weighted adversarial training
+                if rg is not None:
+                    # Recon-gated adversarial training
                     _, _, base_loss, loss_dict = model(X,b,m,i,w,stage="vae",return_adv_components=True)
 
-                    z_shared_batch = loss_dict['_z_shared']
-                    logits_batch = loss_dict['_modality_logits']
+                    per_sample_recon = loss_dict['_per_sample_recon']
                     per_sample_adv = loss_dict['_per_sample_adv']
-                    modality_labels_batch = torch.argmax(m, dim=1)
+                    B = m.shape[0]
 
-                    adv_weights = cw.compute_weights(z_shared_batch, modality_labels_batch, logits_batch)
-                    cw.update_queues(z_shared_batch.detach(), modality_labels_batch)
+                    adv_weights = rg.compute_weights(per_sample_recon)
 
                     # Lambda ramp
                     ramp = min(1.0, max(0.0, (epoch - T_w) / T_r)) if T_r > 0 else 1.0
                     lambda_adv_current = lambda_target * ramp
 
-                    adv_loss_weighted = (adv_weights * per_sample_adv).sum() / m.shape[0]
+                    # 不做权重均值归一化（总对抗压力可降低）
+                    adv_loss_weighted = (adv_weights * per_sample_adv).sum() / B
                     loss = base_loss + lambda_adv_current * adv_loss_weighted
 
                     loss.backward()
@@ -227,7 +220,6 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                         writer.add_scalar("lambda_adv/train", lambda_adv_current, global_step)
                         writer.add_scalar("mean_adv_weight/train", adv_weights.mean().item(), global_step)
                         writer.add_scalar("min_adv_weight/train", adv_weights.min().item(), global_step)
-                        writer.add_scalar("tau_nn/train", cw.current_tau_nn, global_step)
                 else:
                     # Original adversarial training (no confidence weighting)
                     _, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")

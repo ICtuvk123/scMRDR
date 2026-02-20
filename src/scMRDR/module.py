@@ -130,10 +130,8 @@ class Integration:
     def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
               beta = 2, gamma = 1, lambda_adv = 0.01, device=None,
               confidence_weighted=False,
-              cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
-              cw_tau_range=(0.01, 2.0), cw_tau_fallback=0.5,
-              cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
-              cw_min_count=8):
+              cw_w_floor=0.3, cw_w_cap=1.0, cw_tau=1.0,
+              cw_ema_decay=0.99, cw_stats_warmup_steps=50):
         '''
         Setup the model.
         Args:
@@ -145,17 +143,12 @@ class Integration:
             gamma: float, gamma parameter for the gamma distribution
             lambda_adv: float, lambda parameter for the adversarial loss
             device: device to train the model. Default is None, indicating GPU will be used if available.
-            confidence_weighted: bool, whether to use confidence-weighted adversarial training
-            cw_queue_size: int, per-modality FIFO queue capacity
-            cw_alpha: float, fusion weight s = alpha*s_H + (1-alpha)*s_nn
-            cw_c_tau: float, adaptive tau_nn multiplier
-            cw_tau_range: tuple, (tau_min, tau_max) clipping range for tau_nn
-            cw_tau_fallback: float, EMA fallback tau value
-            cw_eta: float, tau_nn EMA decay coefficient
-            cw_rho: float, budget quantile ratio
-            cw_tau_w: float, gating sigmoid temperature
-            cw_w_min: float, minimum weight floor
-            cw_min_count: int, minimum per-modality sample count for threshold
+            confidence_weighted: bool, whether to use recon-gated adversarial training
+            cw_w_floor: float, minimum adversarial weight floor
+            cw_w_cap: float, maximum adversarial weight cap
+            cw_tau: float, sigmoid temperature for gating
+            cw_ema_decay: float, EMA decay for running statistics
+            cw_stats_warmup_steps: int, steps to collect stats before gating
         '''
         self.input_dim = self.data.shape[1]
         self.hidden_layers = hidden_layers
@@ -179,11 +172,8 @@ class Integration:
 
         self.confidence_weighted = confidence_weighted
         self.cw_params = dict(
-            cw_queue_size=cw_queue_size, cw_alpha=cw_alpha, cw_c_tau=cw_c_tau,
-            cw_tau_min=cw_tau_range[0], cw_tau_max=cw_tau_range[1],
-            cw_tau_fallback=cw_tau_fallback, cw_eta=cw_eta,
-            cw_rho=cw_rho, cw_tau_w=cw_tau_w, cw_w_min=cw_w_min,
-            cw_min_count=cw_min_count,
+            cw_w_floor=cw_w_floor, cw_w_cap=cw_w_cap, cw_tau=cw_tau,
+            cw_ema_decay=cw_ema_decay, cw_stats_warmup_steps=cw_stats_warmup_steps,
         )
     
     def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1,
