@@ -52,6 +52,28 @@ sc.pl.umap(
 )
 ```
 
+#### Optional: Diffusion Shared Latent Backend
+You can switch the shared-latent branch from VAE to latent diffusion while keeping the existing decoder/loss pipeline:
+```python
+model.setup(
+    hidden_layers=[512, 512],
+    latent_dim_shared=20,
+    latent_dim_specific=20,
+    beta=2,
+    gamma=5,
+    lambda_adv=5,
+    dropout_rate=0.2,
+    latent_backend="diffusion",
+    lambda_prior_diff=1.0,
+    beta_specific=2.0,
+    diffusion_steps=200,
+    diffusion_hidden_dim=512,
+    diffusion_time_embed_dim=64,
+    diffusion_beta_schedule="linear",
+    diffusion_prior_cond="modality_batch",
+)
+```
+
 ## Citation
 [1] Jianle Sun, Chaoqi Liang, Ran Wei, Peng Zheng, Lei Bai, Wanli Ouyang, Hongliang Yan, Peng Ye. scMRDR: A scalable and flexible framework for unpaired single-cell multi-omics data integration. The Thirty-ninth Annual Conference on Neural Information Processing Systems (NeurIPS), 2025.
 

@@ -3,6 +3,7 @@ from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
+from .anchor import find_mnn_pairs, find_mnn_pairs_latent, anchor_loss
 
 class EarlyStopping:
     '''
@@ -51,7 +52,11 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
                 cw_tau_min=0.01, cw_tau_max=2.0, cw_tau_fallback=0.5,
                 cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
-                cw_min_count=8, cw_adv_ramp_epochs=10, cw_lambda_target=None):
+                cw_min_count=8, cw_adv_ramp_epochs=10, cw_lambda_target=None,
+                lambda_anchor=0.0, k_mnn=30, linked_feature_idx=None,
+                anchor_space="latent", anchor_start_epoch=0,
+                anchor_ramp_epochs=0, anchor_sim_threshold=0.0,
+                anchor_margin=0.0):
     '''
     Train the model.
     Args:
@@ -85,10 +90,16 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
     else:   
         train_data = DataLoader(train_dataset,batch_size,shuffle=True,drop_last=True,num_workers=4,pin_memory=True)
     # optimizer = optim.Adam(model.parameters(), lr=lr)
-    optimizer_vae = torch.optim.Adam(list(model.encoder_shared.parameters()) + 
-                                     list(model.encoder_specific.parameters()) + 
-                                     list(model.decoder.parameters()) +
-                                     list(model.prior_net_specific.parameters()), lr=lr)
+    if hasattr(model, "vae_parameters"):
+        vae_params = list(model.vae_parameters())
+    else:
+        vae_params = (
+            list(model.encoder_shared.parameters())
+            + list(model.encoder_specific.parameters())
+            + list(model.decoder.parameters())
+            + list(model.prior_net_specific.parameters())
+        )
+    optimizer_vae = torch.optim.Adam(vae_params, lr=lr)
     optimizer_d = torch.optim.Adam(model.discriminator.parameters(), lr=lr)
     if adaptlr==True:
         scheduler_d =  torch.optim.lr_scheduler.CosineAnnealingLR(optimizer = optimizer_d,
@@ -118,9 +129,19 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         T_r = cw_adv_ramp_epochs
 
     for epoch in range(epoch_num):
+        # Anchor ramp: Phase A (no anchor) -> Phase B (ramp up)
+        if lambda_anchor > 0 and epoch >= anchor_start_epoch:
+            if anchor_ramp_epochs > 0:
+                ramp = min(1.0, (epoch - anchor_start_epoch) / anchor_ramp_epochs)
+            else:
+                ramp = 1.0
+            lambda_anchor_current = lambda_anchor * ramp
+        else:
+            lambda_anchor_current = 0.0
+
         model.train()
-        total_loss,recon_loss,kl_z,preserve_loss,adv_loss,total_discri_loss = \
-            0,0,0,0,0,0
+        total_loss,recon_loss,kl_z,preserve_loss,adv_loss,total_discri_loss,total_anchor_loss = \
+            0,0,0,0,0,0,0
         for step, (X,b,m,i,w) in enumerate(train_data):
             X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
             X.requires_grad = True
@@ -133,7 +154,27 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
 
             if epoch < num_warmup:
                 model.train()
-                _, _, loss, loss_dict = model(X,b,m,i,w,stage="warmup")
+                mu_shared, _, loss, loss_dict = model(X,b,m,i,w,stage="warmup")
+
+                # Anchor loss (MNN pairs)
+                modality_labels_batch = torch.argmax(m, dim=1)
+                a_loss_val = 0.0
+                if lambda_anchor_current > 0:
+                    if anchor_space == "latent":
+                        mnn_i, mnn_j = find_mnn_pairs_latent(
+                            mu_shared, modality_labels_batch, k=k_mnn,
+                            sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                        )
+                    else:
+                        mnn_i, mnn_j = find_mnn_pairs(
+                            X, modality_labels_batch, model.feat_mask, k=k_mnn,
+                            linked_feature_idx=linked_feature_idx,
+                            sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                        )
+                    a_loss = anchor_loss(mu_shared, mnn_i, mnn_j)
+                    loss = loss + lambda_anchor_current * a_loss
+                    a_loss_val = a_loss.item()
+
                 # with torch.autograd.detect_anomaly():
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
@@ -147,13 +188,13 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
 
                 # Update confidence weighter queues during warmup
                 if cw is not None and '_z_shared' in loss_dict:
-                    modality_labels_batch = torch.argmax(m, dim=1)
                     cw.update_queues(loss_dict['_z_shared'].detach(), modality_labels_batch)
 
                 total_loss+=loss.item()
                 recon_loss+=loss_dict['recon_loss']
                 kl_z+=loss_dict['kl_z']
                 preserve_loss+=loss_dict['preserve_loss']
+                total_anchor_loss+=a_loss_val
 
                 # print(loss)
                 if writer is not None:
@@ -161,6 +202,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                     writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], epoch*num_batch+step+1)
                     writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], epoch*num_batch+step+1)
                     writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
+                    writer.add_scalar("anchor_Loss/train", a_loss_val, epoch*num_batch+step+1)
 
             elif epoch >= num_warmup:
                 ### === Phase A: Train Discriminator === ###
@@ -184,7 +226,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
 
                 if cw is not None:
                     # Confidence-weighted adversarial training
-                    _, _, base_loss, loss_dict = model(X,b,m,i,w,stage="vae",return_adv_components=True)
+                    mu_shared, _, base_loss, loss_dict = model(X,b,m,i,w,stage="vae",return_adv_components=True)
 
                     z_shared_batch = loss_dict['_z_shared']
                     logits_batch = loss_dict['_modality_logits']
@@ -201,6 +243,24 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                     adv_loss_weighted = (adv_weights * per_sample_adv).sum() / m.shape[0]
                     loss = base_loss + lambda_adv_current * adv_loss_weighted
 
+                    # Anchor loss (MNN pairs)
+                    a_loss_val = 0.0
+                    if lambda_anchor_current > 0:
+                        if anchor_space == "latent":
+                            mnn_i, mnn_j = find_mnn_pairs_latent(
+                                mu_shared, modality_labels_batch, k=k_mnn,
+                                sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                            )
+                        else:
+                            mnn_i, mnn_j = find_mnn_pairs(
+                                X, modality_labels_batch, model.feat_mask, k=k_mnn,
+                                linked_feature_idx=linked_feature_idx,
+                                sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                            )
+                        a_loss = anchor_loss(mu_shared, mnn_i, mnn_j)
+                        loss = loss + lambda_anchor_current * a_loss
+                        a_loss_val = a_loss.item()
+
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                     if (step + 1) % accumulation_steps == 0:
@@ -215,6 +275,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                     preserve_loss += loss_dict['preserve_loss']
                     adv_loss += loss_dict_adv_val
                     total_discri_loss += discri_loss.item()
+                    total_anchor_loss += a_loss_val
 
                     if writer is not None:
                         global_step = epoch * num_batch + step + 1
@@ -228,9 +289,30 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                         writer.add_scalar("mean_adv_weight/train", adv_weights.mean().item(), global_step)
                         writer.add_scalar("min_adv_weight/train", adv_weights.min().item(), global_step)
                         writer.add_scalar("tau_nn/train", cw.current_tau_nn, global_step)
+                        writer.add_scalar("anchor_Loss/train", a_loss_val, global_step)
                 else:
                     # Original adversarial training (no confidence weighting)
-                    _, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")
+                    mu_shared, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")
+
+                    # Anchor loss (MNN pairs)
+                    a_loss_val = 0.0
+                    if lambda_anchor_current > 0:
+                        modality_labels_batch = torch.argmax(m, dim=1)
+                        if anchor_space == "latent":
+                            mnn_i, mnn_j = find_mnn_pairs_latent(
+                                mu_shared, modality_labels_batch, k=k_mnn,
+                                sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                            )
+                        else:
+                            mnn_i, mnn_j = find_mnn_pairs(
+                                X, modality_labels_batch, model.feat_mask, k=k_mnn,
+                                linked_feature_idx=linked_feature_idx,
+                                sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                            )
+                        a_loss = anchor_loss(mu_shared, mnn_i, mnn_j)
+                        loss = loss + lambda_anchor_current * a_loss
+                        a_loss_val = a_loss.item()
+
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                     if (step + 1) % accumulation_steps == 0:
@@ -243,6 +325,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                     preserve_loss+=loss_dict['preserve_loss']
                     adv_loss+=loss_dict['adv_loss']
                     total_discri_loss+=discri_loss.item()
+                    total_anchor_loss+=a_loss_val
 
                     if writer is not None:
                         writer.add_scalar("Loss/train", loss.item(), epoch*num_batch+step+1)
@@ -251,23 +334,25 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                         writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], epoch*num_batch+step+1)
                         writer.add_scalar("adv_Loss/train", loss_dict['adv_loss'], epoch*num_batch+step+1)
                         writer.add_scalar("discri_Loss/train", discri_loss.item(), epoch*num_batch+step+1)
+                        writer.add_scalar("anchor_Loss/train", a_loss_val, epoch*num_batch+step+1)
 
                 if (writer is not None) & (adaptlr == True):
                     writer.add_scalar("lr_vae/train",scheduler_vae.get_last_lr()[0],epoch*num_batch+step)
                 if adaptlr == True:
                     scheduler_vae.step()
             
-        if writer is not None:    
+        if writer is not None:
             writer.add_scalar("Loss_epoch/train", total_loss / num_batch, epoch+1)
             writer.add_scalar("recon_Loss_epoch/train", recon_loss / num_batch, epoch+1)
             writer.add_scalar("KLz_Loss_epoch/train", kl_z / num_batch, epoch+1)
             writer.add_scalar("preserve_Loss_epoch/train", preserve_loss / num_batch, epoch+1)
             writer.add_scalar("adv_Loss_epoch/train", adv_loss / num_batch, epoch+1)
             writer.add_scalar("discri_Loss_epoch/train", total_discri_loss / num_batch, epoch+1)
-        
+            writer.add_scalar("anchor_Loss_epoch/train", total_anchor_loss / num_batch, epoch+1)
+
         if (epoch + 1) % 1 == 0:
-            print("epoch {}: loss = {:.4f}, Recon_loss = {:.4f}, KL_loss = {:.4f}, preserve_loss = {:.4f}, adv_loss = {:.4f}, discri_loss = {:.4f}".format( # 
-                epoch+1,total_loss / num_batch, recon_loss / num_batch, kl_z / num_batch, preserve_loss / num_batch, adv_loss / num_batch, total_discri_loss / num_batch)) #
+            print("epoch {}: loss = {:.4f}, Recon = {:.4f}, KL = {:.4f}, preserve = {:.4f}, adv = {:.4f}, discri = {:.4f}, anchor = {:.4f}".format(
+                epoch+1,total_loss / num_batch, recon_loss / num_batch, kl_z / num_batch, preserve_loss / num_batch, adv_loss / num_batch, total_discri_loss / num_batch, total_anchor_loss / num_batch))
         
         if epoch >= num_warmup:
             if early_stopping:
@@ -289,11 +374,12 @@ def validate_model(device, validate_dataset, model, batch_size):
     model.eval()
     validate_data = DataLoader(validate_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
     total_loss= 0
-    for _, (X,b,m,i,w) in enumerate(validate_data):
-        X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
-        _,_,loss,_ = model(X,b,m,i,w,stage="vae")
-        total_loss+=loss.item()    
-    return loss
+    with torch.no_grad():
+        for _, (X,b,m,i,w) in enumerate(validate_data):
+            X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
+            _,_,loss,_ = model(X,b,m,i,w,stage="vae")
+            total_loss += loss.item()
+    return total_loss / max(len(validate_data), 1)
 
 
 def inference_model(device, inference_dataset, model, batch_size):
@@ -330,4 +416,3 @@ def inference_model(device, inference_dataset, model, batch_size):
           total_loss / num_batch, recon_loss / num_batch, kl_z / num_batch, preserve_loss / num_batch, adv_loss / num_batch))  #
     
     return z_shared, z_specific
-

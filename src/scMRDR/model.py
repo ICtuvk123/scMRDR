@@ -2,8 +2,10 @@ import torch
 import numpy as np
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import warnings
 # import torchvision.transforms as transforms
 from .loss import *
+from .diffusion import GaussianDiffusion1D, LatentDenoiserMLP
 from torch.nn import functional as F
 import scipy as sp
 import ot
@@ -327,7 +329,15 @@ class EmbeddingNet(nn.Module):
                 layer_dims=[500,100], latent_dim_shared=20,
                 latent_dim_specific=20, dropout_rate = 0.5, beta = 2, gamma = 1, lambda_adv = 0.01,
                 feat_mask = None, distribution = "ZINB", # count_data = True, positive_outputs = True,
-                encoder_covariates=False, eps=1e-10):
+                encoder_covariates=False, eps=1e-10,
+                latent_backend="vae",
+                lambda_prior_diff=1.0, diffusion_steps=200,
+                diffusion_hidden_dim=512, diffusion_time_embed_dim=64,
+                diffusion_beta_schedule="linear",
+                diffusion_prior_cond="none",
+                beta_specific=None,
+                lambda_diff=None,
+                diffusion_cond=None):
         super(EmbeddingNet, self).__init__()
         
         self.beta = beta
@@ -343,7 +353,34 @@ class EmbeddingNet(nn.Module):
         self.encoder_covariates = encoder_covariates
         self.gamma = gamma
         self.lambda_adv = lambda_adv
+        if beta_specific is None:
+            beta_specific = beta
+        self.beta_specific = beta_specific
+        if lambda_diff is not None:
+            warnings.warn(
+                "lambda_diff is deprecated; use lambda_prior_diff instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            lambda_prior_diff = lambda_diff
+        self.lambda_prior_diff = lambda_prior_diff
+        self.latent_backend = latent_backend
+        if diffusion_cond is not None:
+            warnings.warn(
+                "diffusion_cond is deprecated; use diffusion_prior_cond instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            diffusion_prior_cond = diffusion_cond
+        self.diffusion_prior_cond = diffusion_prior_cond
         self.feat_mask = feat_mask.to(self.device)
+
+        if self.latent_backend not in {"vae", "diffusion"}:
+            raise ValueError("latent_backend must be 'vae' or 'diffusion'")
+        if self.diffusion_prior_cond not in {"none", "modality", "modality_batch", "modality_batch_celltype"}:
+            raise ValueError(
+                "diffusion_prior_cond must be one of: none, modality, modality_batch, modality_batch_celltype"
+            )
 
         self.distribution = distribution
         if self.distribution in ["ZINB", "NB"]:
@@ -375,6 +412,91 @@ class EmbeddingNet(nn.Module):
                                     nn.Dropout(dropout_rate),
                                     nn.Linear(10, 2))
         self.discriminator = ModalityDiscriminator(latent_dim_shared, modality_num, layer_dims=layer_dims, dropout_rate=dropout_rate)   
+
+        self.diffusion = None
+        self.diffusion_denoiser = None
+        if self.latent_backend == "diffusion":
+            cond_dim = 0
+            if self.diffusion_prior_cond != "none":
+                cond_dim = self.modality_num
+                if self.diffusion_prior_cond in {"modality_batch", "modality_batch_celltype"}:
+                    cond_dim += self.covariate_dim
+                if self.diffusion_prior_cond == "modality_batch_celltype":
+                    cond_dim += self.celltype_num
+            self.diffusion = GaussianDiffusion1D(
+                num_steps=diffusion_steps,
+                beta_schedule=diffusion_beta_schedule,
+            )
+            self.diffusion_denoiser = LatentDenoiserMLP(
+                latent_dim=self.latent_dim_shared,
+                cond_dim=cond_dim,
+                hidden_dim=diffusion_hidden_dim,
+                time_embed_dim=diffusion_time_embed_dim,
+                dropout_rate=dropout_rate,
+            )
+
+    def _build_diffusion_cond(self, m, b, w):
+        if self.diffusion_prior_cond == "none":
+            return None
+        cond_parts = [m]
+        if self.diffusion_prior_cond in {"modality_batch", "modality_batch_celltype"} and self.covariate_dim > 0:
+            cond_parts.append(b)
+        if self.diffusion_prior_cond == "modality_batch_celltype" and self.celltype_num > 0:
+            cond_parts.append(w)
+        return torch.cat(cond_parts, dim=-1)
+
+    def _encode_shared(self, x, b, w):
+        if self.celltype_num == 0:
+            if self.encoder_covariates:
+                return self.encoder_shared(torch.cat([x, b], dim=-1))
+            return self.encoder_shared(x)
+        if self.encoder_covariates:
+            return self.encoder_shared(torch.cat([x, b, w], dim=-1))
+        return self.encoder_shared(torch.cat([x, w], dim=-1))
+
+    def _encode_specific(self, x, m, b, w):
+        if self.celltype_num == 0:
+            if self.encoder_covariates:
+                return self.encoder_specific(torch.cat([x, m, b], dim=-1))
+            return self.encoder_specific(torch.cat([x, m], dim=-1))
+        if self.encoder_covariates:
+            return self.encoder_specific(torch.cat([x, m, b, w], dim=-1))
+        return self.encoder_specific(torch.cat([x, m, w], dim=-1))
+
+    def _specific_prior(self, m, w):
+        if self.celltype_num == 0:
+            return torch.chunk(self.prior_net_specific(m), 2, dim=-1)
+        return torch.chunk(self.prior_net_specific(torch.cat([m, w], dim=-1)), 2, dim=-1)
+
+    def _build_shared_latent(self, x, b, m, w):
+        z_shared_raw, mu_shared_raw, logvar_shared_raw = self._encode_shared(x, b, w)
+        if self.latent_backend == "vae":
+            prior_diff_loss = torch.tensor(0.0, device=x.device)
+            return z_shared_raw, mu_shared_raw, logvar_shared_raw, prior_diff_loss
+
+        z0_shared = mu_shared_raw
+        cond = self._build_diffusion_cond(m, b, w)
+        t = self.diffusion.sample_timesteps(z0_shared.shape[0], z0_shared.device)
+        noise = torch.randn_like(z0_shared)
+        z_t = self.diffusion.q_sample(z0_shared, t, noise)
+        eps_pred = self.diffusion_denoiser(z_t, t, cond)
+        z_shared = self.diffusion.predict_x0_from_eps(z_t, t, eps_pred)
+        prior_diff_loss = F.mse_loss(eps_pred, noise)
+        mu_shared = z_shared
+        logvar_shared = torch.zeros_like(z_shared)
+        return z_shared, mu_shared, logvar_shared, prior_diff_loss
+
+    def vae_parameters(self):
+        modules = [
+            self.encoder_shared,
+            self.encoder_specific,
+            self.decoder,
+            self.prior_net_specific,
+        ]
+        if self.latent_backend == "diffusion":
+            modules.append(self.diffusion_denoiser)
+        for module in modules:
+            yield from module.parameters()
     
     def forward(self,x,b,m,i,w,stage="vae",return_adv_components=False):
         '''
@@ -396,25 +518,12 @@ class EmbeddingNet(nn.Module):
             x_original = x
             if self.count_data:
                 x = torch.log1p(x)
-            
-            if self.celltype_num == 0:
-                prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(m), 2, dim=-1)
-                if self.encoder_covariates:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
-                else:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
-            else:
-                prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(torch.cat([m,w],dim=-1)), 2, dim=-1)
-                if self.encoder_covariates:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b,w],dim=-1))
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b,w],dim=-1))
-                else:
-                    z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,w],dim=-1))
-                    z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,w],dim=-1))
 
-            z = torch.cat([z_shared,z_specific],dim=-1)
+            prior_mu, prior_logvar = self._specific_prior(m, w)
+            z_shared, mu_shared, logvar_shared, prior_diff_loss = self._build_shared_latent(x, b, m, w)
+            z_specific, mu_specific, logvar_specific = self._encode_specific(x, m, b, w)
+
+            z = torch.cat([z_shared, z_specific], dim=-1)
             if self.count_data:
                 rho,dispersion,pi = self.decoder(z, b, m)
                 s = self.sample_sequencing_depth(x_original)
@@ -438,8 +547,11 @@ class EmbeddingNet(nn.Module):
                     recon_loss = mseLoss(x_original, rho)
                 else:
                     recon_loss = mseLoss(x_original, rho)
-            kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
-                klLoss(mu_shared, logvar_shared)
+            kl_specific = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)
+            kl_shared = torch.tensor(0.0, device=x.device)
+            if self.latent_backend == "vae":
+                kl_shared = klLoss(mu_shared, logvar_shared)
+            kl_z = kl_specific + kl_shared
             # preserve_loss = zinb_loss(x_original, rho2, dispersion2, pi2, s, eps = self.eps)
             preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)
             # preserve_loss = isometric_loss(torch.cat([z_shared, z_specific],dim=-1),z_shared,m)
@@ -456,11 +568,21 @@ class EmbeddingNet(nn.Module):
             if return_adv_components:
                 per_sample_adv = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='none')  # (B,)
                 adv_loss_scalar = per_sample_adv.sum() / m.shape[0]
-                base_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss
+                base_loss = (
+                    recon_loss
+                    + self.beta_specific * kl_specific
+                    + self.beta * kl_shared
+                    + self.gamma * preserve_loss
+                    + self.lambda_prior_diff * prior_diff_loss
+                )
                 loss_dict = {'total_loss': (base_loss + self.lambda_adv * adv_loss_scalar).item(),
                             'recon_loss': recon_loss.item(), 'kl_z': kl_z.item(),
+                            'kl_specific': kl_specific.item(),
+                            'kl_shared': kl_shared.item(),
                             'preserve_loss': preserve_loss.item(),
                             'adv_loss': adv_loss_scalar.item(),
+                            'prior_diff_loss': prior_diff_loss.item(),
+                            'diff_loss': prior_diff_loss.item(),
                             '_z_shared': z_shared,
                             '_modality_logits': modality_logits_adv,
                             '_per_sample_adv': per_sample_adv,
@@ -468,31 +590,36 @@ class EmbeddingNet(nn.Module):
                 return mu_shared, mu_specific, base_loss, loss_dict
             else:
                 adv_loss = -F.cross_entropy(modality_logits_adv, modality_labels, reduction='sum')/m.shape[0]
-                total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss + self.lambda_adv * adv_loss
+                total_loss = (
+                    recon_loss
+                    + self.beta_specific * kl_specific
+                    + self.beta * kl_shared
+                    + self.gamma * preserve_loss
+                    + self.lambda_prior_diff * prior_diff_loss
+                    + self.lambda_adv * adv_loss
+                )
                 loss_dict = {'total_loss':total_loss.item(),
                             'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
+                            'kl_specific': kl_specific.item(),
+                            'kl_shared': kl_shared.item(),
                             'preserve_loss': preserve_loss.item(),
-                            'adv_loss': adv_loss.item()
+                            'adv_loss': adv_loss.item(),
+                            'prior_diff_loss': prior_diff_loss.item(),
+                            'diff_loss': prior_diff_loss.item(),
                             }
                 return mu_shared, mu_specific, total_loss, loss_dict
         elif stage=="discriminator":
-            x_original = x
             if self.count_data:
                 x = torch.log1p(x)
-            
-            # prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(m), 2, dim=-1)
-            if self.encoder_covariates:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
-                # z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
+
+            z_shared, mu_shared, _ = self._encode_shared(x, b, w)
+            if self.latent_backend == "diffusion":
+                z_for_disc = mu_shared
             else:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
-                # z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
-    
-            # rho2,dispersion2,pi2 = self.decoder2(z_shared, b, m)
-            
-            #loss
+                z_for_disc = z_shared
+
             modality_labels = torch.argmax(m, dim=1)
-            z_shared_detached = z_shared.clone().detach()
+            z_shared_detached = z_for_disc.clone().detach()
             modality_logits = self.discriminator(z_shared_detached) #
             discri_loss = F.cross_entropy(modality_logits, modality_labels, reduction='sum')/m.shape[0]
             return discri_loss
@@ -501,15 +628,11 @@ class EmbeddingNet(nn.Module):
             x_original = x
             if self.count_data:
                 x = torch.log1p(x)
-            
-            prior_mu, prior_logvar = torch.chunk(self.prior_net_specific(m), 2, dim=-1)
-            if self.encoder_covariates:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(torch.cat([x,b],dim=-1))
-                z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m,b],dim=-1))
-            else:
-                z_shared, mu_shared, logvar_shared = self.encoder_shared(x)
-                z_specific, mu_specific, logvar_specific = self.encoder_specific(torch.cat([x,m],dim=-1))
-            z = torch.cat([z_shared,z_specific],dim=-1)
+
+            prior_mu, prior_logvar = self._specific_prior(m, w)
+            z_shared, mu_shared, logvar_shared, prior_diff_loss = self._build_shared_latent(x, b, m, w)
+            z_specific, mu_specific, logvar_specific = self._encode_specific(x, m, b, w)
+            z = torch.cat([z_shared, z_specific], dim=-1)
             if self.count_data:
                 rho,dispersion,pi = self.decoder(z, b, m)
                 s = self.sample_sequencing_depth(x_original)
@@ -527,13 +650,26 @@ class EmbeddingNet(nn.Module):
                 recon_loss = zinb_loss(x_original, rho, dispersion, pi, s, mask, eps = self.eps)
             else:
                 recon_loss = mseLoss(x_original, rho, mask)
-            kl_z = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)+\
-                klLoss(mu_shared, logvar_shared)
+            kl_specific = klLoss_prior(mu_specific, logvar_specific, prior_mu, prior_logvar)
+            kl_shared = torch.tensor(0.0, device=x.device)
+            if self.latent_backend == "vae":
+                kl_shared = klLoss(mu_shared, logvar_shared)
+            kl_z = kl_specific + kl_shared
             preserve_loss = isometric_loss(torch.cat([mu_shared, mu_specific],dim=-1),mu_shared,m)  
             # hsic = 1000 * HSICloss(z_shared,m)
-            total_loss = recon_loss + self.beta*kl_z + self.gamma * preserve_loss #+ hsic
+            total_loss = (
+                recon_loss
+                + self.beta_specific * kl_specific
+                + self.beta * kl_shared
+                + self.gamma * preserve_loss
+                + self.lambda_prior_diff * prior_diff_loss
+            ) #+ hsic
             loss_dict = {'recon_loss':recon_loss.item(),'kl_z':kl_z.item(),
+                        'kl_specific': kl_specific.item(),
+                        'kl_shared': kl_shared.item(),
                         'preserve_loss': preserve_loss.item(),
+                        'prior_diff_loss': prior_diff_loss.item(),
+                        'diff_loss': prior_diff_loss.item(),
                         # 'hsic': hsic.item(),
                         'total_loss':total_loss.item(),
                         '_z_shared': z_shared,

@@ -1,5 +1,6 @@
 import os
 os.environ['JAX_PLATFORM_NAME'] = 'cpu'
+os.environ.setdefault('NUMBA_CACHE_DIR', '/tmp/numba_cache')
 
 import pandas as pd 
 import numpy as np 
@@ -11,6 +12,7 @@ from scib_metrics.benchmark import Benchmarker, BioConservation, BatchCorrection
 
 import os
 import warnings
+from pathlib import Path
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -437,6 +439,91 @@ class Benchmarker2:
 #     torch.backends.cudnn.deterministic = True
 #     torch.backends.cudnn.benchmark = False
 # set_seed(42)
+
+
+def run_local_bmmc_metrics(
+    adata_path: str,
+    outdir: str,
+    embedding_key: str = "latent_shared",
+    method_name: str = "Ours",
+    batch_key: str = "batch",
+    label_key: str = "celltype",
+    modality_key: str = "modality",
+    n_jobs: int = 8,
+) -> None:
+    adata = sc.read_h5ad(adata_path)
+    if embedding_key not in adata.obsm:
+        raise KeyError(
+            f"Embedding key '{embedding_key}' not found in adata.obsm. "
+            f"Available keys: {list(adata.obsm.keys())}"
+        )
+    if batch_key not in adata.obs.columns:
+        raise KeyError(f"batch_key '{batch_key}' not found in adata.obs.")
+    if label_key not in adata.obs.columns:
+        raise KeyError(f"label_key '{label_key}' not found in adata.obs.")
+    if modality_key not in adata.obs.columns:
+        raise KeyError(f"modality_key '{modality_key}' not found in adata.obs.")
+
+    adata.obs[modality_key] = adata.obs[modality_key].astype(str)
+    adata.obsm[method_name] = adata.obsm[embedding_key].copy()
+
+    bm2 = Benchmarker2(
+        adata,
+        batch_key=batch_key,
+        label_key=label_key,
+        modality_key=modality_key,
+        bio_conservation_metrics=BioConservation2(),
+        batch_correction_metrics=BatchCorrection2(),
+        modality_integration_metrics=ModalityIntegration2(),
+        embedding_obsm_keys=[method_name],
+        n_jobs=n_jobs,
+    )
+    bm2.benchmark()
+
+    out_path = Path(outdir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    unscaled_csv = out_path / "unscaled_metrics_local.csv"
+    scaled_csv = out_path / "scaled_metrics_local.csv"
+
+    df_unscaled = bm2.get_results(min_max_scale=False)
+    df_unscaled.to_csv(unscaled_csv)
+    df_scaled = bm2.get_results(min_max_scale=True)
+    df_scaled.to_csv(scaled_csv)
+
+    summary_cols = [c for c in ["Batch correction", "Modality integration", "Bio conservation", "Total"] if c in df_unscaled.columns]
+    print(df_unscaled.loc[method_name, summary_cols])
+    print(f"Saved unscaled metrics: {unscaled_csv}")
+    print(f"Saved scaled metrics: {scaled_csv}")
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--local-bmmc", action="store_true", help="Run local BMMC metrics on one embedding.")
+    parser.add_argument("--adata", type=str, default="experiments/BMMC_codes/feature_aligned_trained_sampled.h5ad")
+    parser.add_argument("--outdir", type=str, default="experiments/plots")
+    parser.add_argument("--embedding-key", type=str, default="latent_shared")
+    parser.add_argument("--method-name", type=str, default="Ours")
+    parser.add_argument("--batch-key", type=str, default="batch")
+    parser.add_argument("--label-key", type=str, default="celltype")
+    parser.add_argument("--modality-key", type=str, default="modality")
+    parser.add_argument("--n-jobs", type=int, default=8)
+    args, _ = parser.parse_known_args()
+
+    if args.local_bmmc:
+        run_local_bmmc_metrics(
+            adata_path=args.adata,
+            outdir=args.outdir,
+            embedding_key=args.embedding_key,
+            method_name=args.method_name,
+            batch_key=args.batch_key,
+            label_key=args.label_key,
+            modality_key=args.modality_key,
+            n_jobs=args.n_jobs,
+        )
+        sys.exit(0)
 
 
 import os
