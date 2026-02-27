@@ -1,182 +1,340 @@
-  # Gate-Adv 机制重设计（面向“单模态稀有细胞”）
+# Gate-Adv 机制完整说明（实现对齐版）
 
-  ## Summary
+本文档对应当前分支 `feat/robust-gate-adv` 的实现，覆盖：
+- 置信度（gate weight）如何计算
+- 如何处理稀有/单模态（orphan）样本
+- 如何接入 adversarial loss（双分支）
+- 训练时序与关键超参数
 
-  目标是在你现有 VAE/Diffusion + adversarial + anchor 框架里，保留 gate 创新点，同时解决三类问题：
+对应代码：
+- `src/scMRDR/confidence.py` (`ConfidenceWeighter`, `RobustAdvGate`)
+- `src/scMRDR/train.py`（双分支 adversarial 训练）
+- `src/scMRDR/module.py`（参数透传）
+- `scripts/train_anchor.py` / `scripts/grid_search_anchor.py`（CLI）
 
-  1. 早期特征差导致置信度失真
-  2. 稀有细胞只存在单模态，易被错罚或被忽略
-  3. NMI/ARI 上升但 iLISI 大幅下滑
+---
 
-  核心策略：把现在“单路 gate 控全部 adv”改为“双路 adv + 分层 gate + 预算约束 + 稀有保护”。
+## 1. 记号定义
 
-  ———
+- 共享表征：`z_i`（第 `i` 个样本）
+- 模态标签：`m_i \in \{1,\dots,M\}`
+- 判别器输出 logits：`\ell_i = D(z_i)`
+- 判别器概率：`p_i = softmax(\ell_i)`
+- 对抗样本项：
 
-  ## 1) 机制设计（决策已定）
+$$
+a_i = -\mathrm{CE}(D(z_i), m_i)
+$$
 
-  ### 1.1 双路 adversarial（防 iLISI 崩）
+这里 `a_i` 越大，代表“越难被判别器正确识别模态”，对抗目标越满足。
 
-  定义每个样本的对抗项 a_i = -CE(D(z_i), m_i)，总对抗损失改为：
+---
 
-  [
-  L_{adv} = \lambda_{base}\cdot \frac{1}{B}\sum_i a_i + \lambda_{gate}\cdot \frac{1}{B}\sum_i w_i a_i
-  ]
+## 2. 置信度权重 w_i 的计算（RobustAdvGate）
 
-  - base 路永远开启，保证全局混合压力不消失（保护 iLISI）
-  - gate 路做精细重加权，服务稀有/困难样本鲁棒性
-  - 默认：lambda_base = 0.35 * lambda_adv, lambda_gate = 0.65 * lambda_adv
+最终权重由三层组成：
+1. 可靠性（reliability）
+2. 可迁移性（transferability）
+3. 模态预算 + 稀有保护（budget + rare protection）
 
-  ### 1.2 分层 gate（替换现有单分数）
+### 2.1 可靠性分量（来自判别器熵）
 
-  每个样本权重 w_i 由三部分构成：
+先算归一化熵：
 
-  [
-  w_i = clip(w_{floor} + (1-w_{floor})\cdot g_i \cdot t_i + b_i,; w_{floor},; 1)
-  ]
+$$
+H_i = -\frac{1}{\log M}\sum_{k=1}^{M} p_{ik}\log(p_{ik}+\epsilon)
+$$
 
-  - g_i（可靠性 gate）
-    g_i = sigmoid(( (1-H_i) - tau_H ) / T_H )
-    用 1-entropy，不再直接用高熵高权重
-  - t_i（可迁移性 gate）
-    用跨模态 MNN 的 top1 相似度与 margin 组合（都来自 stop-grad 特征）
-  - b_i（稀有保护 boost）
-    对稀有模态/稀有簇样本加小幅正偏置（防被系统性降权）
+可靠性原分数：
 
-  ### 1.3 稀有单模态样本（orphan）策略
+$$
+r_i = 1 - H_i
+$$
 
-  定义 orphan：跨模态相似度长期低于阈值且 margin 不稳定。
-  对 orphan：
+然后使用分位数阈值 + EMA：
 
-  - 不把权重打到极低，设 w_orphan_min >= 0.45
-  - 仅在 gate 路减弱，不影响 base 路
-  - 禁止 orphan 参与“高置信跨模态配对统计”，避免污染队列阈值
+$$
+\tau_H^{(batch)} = Q_{1-\rho_{target}}(\{r_i\})
+$$
 
-  ### 1.4 早期不稳定问题（硬性时间表）
+$$
+\tau_H \leftarrow \eta\,\tau_H + (1-\eta)\,\tau_H^{(batch)}
+$$
 
-  训练分三段：
+可靠性门：
 
-  1. Warmup-A：仅重构/KL/isometric（可保留现有 warmup）
-  2. Warmup-B：训练判别器 + base-adv，不启用 gate 打分，只填队列
-  3. Gate-On：启用完整 gate + 双路 adv，lambda_gate 再线性 ramp
+$$
+g_i^{(rel)} = \sigma\!\left(\frac{r_i - \tau_H}{\tau_w}\right)
+$$
 
-  默认 epoch 比例：20% / 20% / 60%
+> 与旧版不同：这里使用 `1-entropy` 而不是直接使用 entropy，避免“高不确定样本总被加权”。
 
-  ### 1.5 预算约束（防某模态被“饿死”）
+### 2.2 可迁移性分量（跨模态 NN）
 
-  把你现在的 per-modality quantile gate 改为“目标平均权重约束”：
+维护每个模态的 L2-normalized 队列（FIFO）。
+对样本 `i`，只在“其它模态队列”里找最近邻余弦相似度。
 
-  - 每模态目标 E[w|m]=rho_m，默认 rho_m=0.65
-  - 稀有模态 rho_m 自动上调：rho_m += rarity_factor
-  - 通过每模态可学习阈值 tau_m 的 EMA 调整实现
+- `s_i^{top1}`: top-1 cosine similarity
+- `s_i^{top2}`: top-2 cosine similarity（若不足2个邻居则退化为 top1）
+- 距离：
 
-  ———
+$$
+d_i = 1 - s_i^{top1}
+$$
 
-  ## 2) 与现有代码的接口改动（public API）
+扩散温度同样使用中位数 + EMA：
 
-  ### 2.1 Integration.setup(...) 新增
+$$
+\tau_{nn}^{(batch)} = clip\left(c_\tau\cdot median(\{d_i\}),\,\tau_{min},\tau_{max}\right)
+$$
 
-  - gate_mode: str = "robust_adv" (none|legacy|robust_adv)
-  - gate_start_epoch: int
-  - gate_ramp_epochs: int
-  - lambda_adv_base_ratio: float = 0.35
-  - w_floor: float = 0.15
-  - w_orphan_min: float = 0.45
-  - rho_target: float = 0.65
-  - rarity_boost: float = 0.10
+$$
+\tau_{nn} \leftarrow \eta\,\tau_{nn} + (1-\eta)\,\tau_{nn}^{(batch)}
+$$
 
-  ### 2.2 train_anchor.py 新增 CLI
+相似性得分：
 
-  - --confidence-weighted（真正暴露开关）
-  - --gate-mode
-  - --gate-start-epoch
-  - --gate-ramp-epochs
-  - --lambda-adv-base-ratio
-  - --w-floor
-  - --w-orphan-min
-  - --rho-target
-  - --rarity-boost
+$$
+s_i^{(sim)} = \exp\left(-\frac{d_i}{\tau_{nn}}\right)
+$$
 
-  ### 2.3 loss_dict / 日志新增
+margin 得分（用 top1-top2）：
 
-  - adv_base_loss, adv_gate_loss
-  - mean_weight_by_modality, orphan_ratio_by_modality
-  - gate_tau_H, gate_tau_nn, rho_realized_by_modality
+$$
+\Delta_i = max(s_i^{top1} - s_i^{top2}, 0)
+$$
 
-  ———
+$$
+s_i^{(margin)} = \sigma\!\left(\frac{\Delta_i - \delta_{margin}}{\tau_w}\right)
+$$
 
-  ## 3) 代码实现路径（文件级）
+可迁移性融合：
 
-  1. src/scMRDR/confidence.py
+$$
+t_i = \alpha\, s_i^{(sim)} + (1-\alpha)\, s_i^{(margin)}
+$$
 
-  - 新增 RobustAdvGate（保留旧 ConfidenceWeighter 兼容）
-  - 实现三分量权重、orphan 掩码、每模态预算阈值 EMA
+### 2.3 预评分（reliability × transferability）
 
-  2. src/scMRDR/train.py
+$$
+u_i = g_i^{(rel)} \cdot t_i
+$$
 
-  - 改 cw is not None 分支：从单路 w_i * adv_i 改为双路组合
-  - 增加三阶段调度
-  - 记录新增诊断指标
+### 2.4 模态预算阈值（防止某模态被“饿死”）
 
-  3. src/scMRDR/module.py
+对每个模态 `m`，记 batch 内样本数为 `n_m`，最大模态样本数为 `n_{max}`。
+稀有度：
 
-  - setup/train 参数透传与默认值
-  - gate_mode 分流：none/legacy/robust_adv
+$$
+rare_m = 1 - \frac{n_m}{max(1,n_{max})}
+$$
 
-  4. scripts/train_anchor.py
+该模态的目标保留率：
 
-  - 增加上述 CLI，并传递到 model.setup()/train()
+$$
+\rho_m = clip(\rho_{target} + rarity\_boost\cdot rare_m,\,0.05,\,0.95)
+$$
 
-  5. scripts/grid_search_anchor.py
+阈值规则：
+- 若 `n_m < min_count`，使用全局阈值
+- 否则使用该模态分位数阈值 + EMA
 
-  - 首轮仅搜稳态关键项：lambda_adv, lambda_anchor, lambda_adv_base_ratio, rho_target
-  - 其余使用稳健默认，避免组合爆炸
+$$
+\tau_m^{(batch)} = Q_{1-\rho_m}(\{u_i\mid m_i=m\})
+$$
 
-  ———
+$$
+\tau_m \leftarrow \eta\,\tau_m + (1-\eta)\,\tau_m^{(batch)}
+$$
 
-  ## 4) 为什么这套能覆盖你提的“所有问题”
+模态内 gate：
 
-  1. 早期特征差
+$$
+g_i = \sigma\!\left(\frac{u_i - \tau_{m_i}}{\tau_w}\right)
+$$
 
-  - Gate 延迟启用 + 独立 ramp + EMA 阈值，避免冷启动误判
+### 2.5 基础权重 + 稀有加成
 
-  2. 单模态稀有细胞
+$$
+\tilde w_i = w_{floor} + (1-w_{floor})\,g_i + rarity\_boost\cdot rare_{m_i}
+$$
 
-  - orphan 下限 + 稀有 boost + 模态预算，避免被全局门控压死
+然后裁剪到 `[w_floor,1]`：
 
-  3. NMI/ARI 与 iLISI 冲突
+$$
+\tilde w_i \leftarrow clip(\tilde w_i, w_{floor}, 1)
+$$
 
-  - base-adv 保底全局混合，gate 只做精修，不再“一刀切”
+### 2.6 orphan 判定与保护
 
-  4. isometric loss 的定位
+当样本存在跨模态候选时（`has_cross=True`），若满足：
 
-  - 保留其“类内结构稳定器”角色，但不把它当跨模态稀有问题主解法
+$$
+s_i^{top1} < \delta_{sim} \quad \text{or} \quad \Delta_i < \delta_{margin}
+$$
 
-  ———
+则判定为 orphan。对 orphan 施加下限保护：
 
-  ## 5) 验证方案（必须执行）
+$$
+w_i = max(\tilde w_i, w_{orphan\_min})
+$$
 
-  ### 5.1 Ablation（最小集）
+非 orphan 则：
 
-  1. baseline adv（无 gate）
-  2. legacy gate（你当前）
-  3. robust gate（新方案）
-  4. robust gate + anchor
-  5. robust gate + anchor + diffusion（可选）
+$$
+w_i = \tilde w_i
+$$
 
-  ### 5.2 验收阈值（相对 baseline）
+最终 `w_i \in [w_floor,1]`。
 
-  - 稀有群召回/邻域纯度不下降（自定义 rare-cell 指标）
+---
 
-  ### 5.3 失败模式与回退
+## 3. Gate 如何作用到对抗器（双分支）
 
-  - 若 iLISI 仍明显下滑：提高 lambda_adv_base_ratio 到 0.5
-  - 若 rare 群仍被压：提高 w_orphan_min 到 0.55
-  - 若 NMI/ARI 回落过大：增 rarity_boost 并收紧 tau_H
+## 3.1 总体思想
 
-  ———
+把 adv 拆成两条路：
+- `base` 路：不加权，保证全局混合压力（保护 iLISI）
+- `gate` 路：加权，做细粒度控制（提升稀有/难样本鲁棒性）
 
-  ## 6) 默认假设（已选定）
+### 3.2 对抗系数分解
 
-  - 你继续用当前 adv + anchor 主训练路径，不引入 unbalanced OT 主干
-  - 你接受先做“鲁棒 gate”再考虑更重的 OT 方案
-  - 主目标是“保持 iLISI 不崩的前提下提升 rare-cell 对齐质量”
+设当前 epoch 的对抗强度（含 warmup 后 ramp）为 `\lambda_{adv}^{cur}`：
+
+$$
+\lambda_{base} = \lambda_{adv}^{cur}\cdot r_{base}
+$$
+
+$$
+\lambda_{gate}^{full} = \lambda_{adv}^{cur}\cdot (1-r_{base})
+$$
+
+其中 `r_base = lambda_adv_base_ratio`。
+
+gate 分支再有独立启用/爬坡：
+
+$$
+r_{gate}(e)=
+\begin{cases}
+0, & e < e_{gate\_start}\\
+min\left(1, \frac{e-e_{gate\_start}}{E_{gate\_ramp}}\right), & e\ge e_{gate\_start}
+\end{cases}
+$$
+
+$$
+\lambda_{gate} = \lambda_{gate}^{full} \cdot r_{gate}(e)
+$$
+
+### 3.3 双分支对抗损失
+
+$$
+L_{adv}^{base} = \frac{1}{B}\sum_i a_i
+$$
+
+$$
+L_{adv}^{gate} = \frac{1}{B}\sum_i w_i a_i
+$$
+
+$$
+L_{adv}^{total} = \lambda_{base}L_{adv}^{base} + \lambda_{gate}L_{adv}^{gate}
+$$
+
+训练中与主干损失相加：
+
+$$
+L = L_{base\_model} + L_{adv}^{total} + L_{anchor}
+$$
+
+其中 `L_base_model` 为模型返回的 `base_loss`（重构、KL、保结构、diff prior 等）。
+
+---
+
+## 4. 训练时序
+
+- `epoch < num_warmup`：warmup（无判别器对抗）
+- `epoch >= num_warmup`：进入判别器-生成器交替训练
+  - 若 `confidence_weighted=False`：旧式 adv
+  - 若 `confidence_weighted=True` 且 `gate_mode=legacy`：旧 confidence weighter
+  - 若 `confidence_weighted=True` 且 `gate_mode=robust_adv`：使用本文双分支 gate-adv
+
+额外注意：
+- `lambda_adv_current` 本身会在 warmup 后按 `cw_adv_ramp_epochs` 线性拉升
+- 即使 gate 分支关闭，base 分支仍可工作（只要 `r_base>0`）
+
+---
+
+## 5. 关键超参数解释
+
+- `lambda_adv_base_ratio`：base 路占比，越大越保混合（iLISI 更稳）
+- `rho_target`：目标保留率，越大整体权重越高
+- `w_floor`：最小权重下限
+- `w_orphan_min`：orphan 样本下限保护
+- `rarity_boost`：稀有模态加权强度（同时影响 `rho_m` 与 `w_i`）
+- `gate_start_epoch`：gate 分支开始生效时刻
+- `gate_ramp_epochs`：gate 分支爬坡时长
+- `orphan_sim_threshold` / `orphan_margin_threshold`：orphan 判定阈值
+
+---
+
+## 6. 日志与诊断（TensorBoard）
+
+robust gate 模式新增监控：
+- `tau_h/train`, `tau_nn/train`
+- `adv_base_unscaled/train`, `adv_gate_unscaled/train`
+- `lambda_adv_gate/train`
+- `mean_adv_weight_by_modality/train/m{idx}`
+- `orphan_ratio_by_modality/train/m{idx}`
+- `gate_threshold_by_modality/train/m{idx}`
+
+建议重点看：
+1. orphan ratio 是否长期过高
+2. 各模态 mean weight 是否长期失衡
+3. iLISI 下滑时 `lambda_adv_gate` 是否过快拉满
+
+---
+
+## 7. CLI 使用示例
+
+单次训练（robust gate）：
+
+```bash
+python scripts/train_anchor.py \
+  --input-h5ad <data.h5ad> \
+  --output-h5ad <out.h5ad> \
+  --confidence-weighted \
+  --gate-mode robust_adv \
+  --lambda-adv 10 \
+  --lambda-adv-base-ratio 0.35 \
+  --rho-target 0.65 \
+  --w-floor 0.15 \
+  --w-orphan-min 0.45 \
+  --rarity-boost 0.10 \
+  --gate-start-epoch 20 \
+  --gate-ramp-epochs 10
+```
+
+网格搜索（含 gate 关键项）：
+
+```bash
+python scripts/grid_search_anchor.py \
+  --input-h5ad <data.h5ad> \
+  --search-outdir <outdir> \
+  --confidence-weighted \
+  --gate-mode robust_adv \
+  --lambda-adv-grid 5,10,15 \
+  --lambda-adv-base-ratio-grid 0.3,0.4 \
+  --rho-target-grid 0.6,0.7
+```
+
+---
+
+## 8. 与 legacy gate 的关系
+
+- `legacy`：保持旧行为，便于对照实验
+- `robust_adv`：新增双分支 + 分层 gate + orphan 保护 + 模态预算
+
+建议在论文/实验中至少做以下对照：
+1. no-gate adv
+2. legacy gate
+3. robust gate（本方案）
+4. robust gate + anchor

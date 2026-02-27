@@ -131,10 +131,14 @@ class Integration:
     def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
               beta = 2, gamma = 1, lambda_adv = 0.01, device=None,
               confidence_weighted=False,
+              gate_mode="robust_adv",
               cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
               cw_tau_range=(0.01, 2.0), cw_tau_fallback=0.5,
               cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
               cw_min_count=8,
+              lambda_adv_base_ratio=0.35, rho_target=0.65,
+              w_orphan_min=0.45, rarity_boost=0.10,
+              orphan_sim_threshold=0.15, orphan_margin_threshold=0.02,
               linked_features=None,
               latent_backend="vae",
               lambda_prior_diff=1.0,
@@ -158,6 +162,7 @@ class Integration:
             lambda_adv: float, lambda parameter for the adversarial loss
             device: device to train the model. Default is None, indicating GPU will be used if available.
             confidence_weighted: bool, whether to use confidence-weighted adversarial training
+            gate_mode: confidence gating backend, "legacy" or "robust_adv"
             cw_queue_size: int, per-modality FIFO queue capacity
             cw_alpha: float, fusion weight s = alpha*s_H + (1-alpha)*s_nn
             cw_c_tau: float, adaptive tau_nn multiplier
@@ -168,6 +173,12 @@ class Integration:
             cw_tau_w: float, gating sigmoid temperature
             cw_w_min: float, minimum weight floor
             cw_min_count: int, minimum per-modality sample count for threshold
+            lambda_adv_base_ratio: ratio for base adversarial branch in robust gate mode
+            rho_target: target keep ratio used by robust gate budget control
+            w_orphan_min: minimum gate weight for orphan samples
+            rarity_boost: rare-modality boost for robust gate
+            orphan_sim_threshold: orphan threshold for cross-modal top1 similarity
+            orphan_margin_threshold: orphan threshold for top1-top2 margin
             linked_features: optional list/array of linked feature indices or names
                 used for raw-space MNN pairing in anchor loss
             latent_backend: "vae" or "diffusion" for shared latent modeling
@@ -223,11 +234,18 @@ class Integration:
 
         self.confidence_weighted = confidence_weighted
         self.cw_params = dict(
+            gate_mode=gate_mode,
             cw_queue_size=cw_queue_size, cw_alpha=cw_alpha, cw_c_tau=cw_c_tau,
             cw_tau_min=cw_tau_range[0], cw_tau_max=cw_tau_range[1],
             cw_tau_fallback=cw_tau_fallback, cw_eta=cw_eta,
             cw_rho=cw_rho, cw_tau_w=cw_tau_w, cw_w_min=cw_w_min,
             cw_min_count=cw_min_count,
+            lambda_adv_base_ratio=lambda_adv_base_ratio,
+            rho_target=rho_target,
+            w_orphan_min=w_orphan_min,
+            rarity_boost=rarity_boost,
+            orphan_sim_threshold=orphan_sim_threshold,
+            orphan_margin_threshold=orphan_margin_threshold,
         )
 
         # Linked features for MNN anchor loss
@@ -281,6 +299,7 @@ class Integration:
               weighted = False,
               tensorboard = False, savepath = "./", random_state=42,
               cw_adv_ramp_epochs=10, cw_lambda_target=None,
+              gate_start_epoch=None, gate_ramp_epochs=10,
               lambda_anchor=0.0, k_mnn=30,
               anchor_space="latent", anchor_start_epoch=0,
               anchor_ramp_epochs=0, anchor_sim_threshold=0.0,
@@ -303,6 +322,8 @@ class Integration:
             random_state: int, random seed
             cw_adv_ramp_epochs: int, number of epochs for lambda_adv to ramp from 0 to target
             cw_lambda_target: float, target lambda_adv value (None uses model's lambda_adv)
+            gate_start_epoch: int or None, epoch to enable gated branch in robust mode
+            gate_ramp_epochs: int, epochs to ramp gated branch weight to target
         '''
         if tensorboard:
             print("Using tensorboard!")
@@ -332,6 +353,8 @@ class Integration:
             confidence_weighted=self.confidence_weighted,
             cw_adv_ramp_epochs=cw_adv_ramp_epochs,
             cw_lambda_target=cw_lambda_target,
+            gate_start_epoch=gate_start_epoch,
+            gate_ramp_epochs=gate_ramp_epochs,
             **self.cw_params,
         )
         anchor_kwargs = dict(
@@ -348,6 +371,14 @@ class Integration:
             print(f"Anchor config: space={anchor_space}, start_epoch={anchor_start_epoch}, "
                   f"ramp_epochs={anchor_ramp_epochs}, lambda={lambda_anchor}")
             print(f"  Confidence filters: sim_threshold={anchor_sim_threshold}, margin={anchor_margin}")
+        if self.confidence_weighted:
+            print(
+                "Gate-adv config: "
+                f"mode={self.cw_params['gate_mode']}, "
+                f"start_epoch={gate_start_epoch}, ramp_epochs={gate_ramp_epochs}, "
+                f"base_ratio={self.cw_params['lambda_adv_base_ratio']:.3f}, "
+                f"rho_target={self.cw_params['rho_target']:.3f}"
+            )
         if weighted:
             weights = 1.0 / np.bincount(self.modality.argmax(-1))
             sample_weights = weights[self.modality.argmax(-1)]

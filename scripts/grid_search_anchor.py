@@ -33,9 +33,9 @@ def parse_int_list(text: str) -> list[int]:
     return values
 
 
-def dedup_grid(grid: list[tuple[float, float, float, int, float, float]]) -> list[tuple[float, float, float, int, float, float]]:
-    seen: set[tuple[float, float, float, int, float, float]] = set()
-    out: list[tuple[float, float, float, int, float, float]] = []
+def dedup_grid(grid: list[tuple]) -> list[tuple]:
+    seen: set[tuple] = set()
+    out: list[tuple] = []
     for item in grid:
         if item in seen:
             continue
@@ -61,6 +61,9 @@ def make_run_name(prefix: str, cfg: dict) -> str:
     )
     if cfg.get("latent_backend") == "diffusion":
         name += f"_ld{fmt_num(cfg['lambda_prior_diff'])}"
+    if cfg.get("confidence_weighted"):
+        name += f"_gbr{fmt_num(cfg['lambda_adv_base_ratio'])}"
+        name += f"_rho{fmt_num(cfg['rho_target'])}"
     return name
 
 
@@ -113,8 +116,20 @@ def main() -> None:
     parser.add_argument("--diffusion-cond", type=str, default=None,
                         choices=["none", "modality", "modality_batch", "modality_batch_celltype"],
                         help="Deprecated alias of --diffusion-prior-cond.")
+    parser.add_argument("--confidence-weighted", action="store_true")
+    parser.add_argument("--gate-mode", type=str, default="robust_adv", choices=["legacy", "robust_adv"])
+    parser.add_argument("--cw-adv-ramp-epochs", type=int, default=10)
+    parser.add_argument("--gate-start-epoch", type=int, default=None)
+    parser.add_argument("--gate-ramp-epochs", type=int, default=10)
+    parser.add_argument("--w-floor", type=float, default=0.15)
+    parser.add_argument("--w-orphan-min", type=float, default=0.45)
+    parser.add_argument("--rarity-boost", type=float, default=0.10)
+    parser.add_argument("--orphan-sim-threshold", type=float, default=0.15)
+    parser.add_argument("--orphan-margin-threshold", type=float, default=0.02)
 
     parser.add_argument("--lambda-adv-grid", type=parse_float_list, default=[5.0, 10.0, 15.0])
+    parser.add_argument("--lambda-adv-base-ratio-grid", type=parse_float_list, default=[0.35])
+    parser.add_argument("--rho-target-grid", type=parse_float_list, default=[0.65])
     parser.add_argument("--lambda-anchor-grid", type=parse_float_list, default=[0.01, 0.02, 0.03])
     parser.add_argument("--lambda-prior-diff-grid", type=parse_float_list, default=None)
     parser.add_argument("--lambda-diff-grid", type=parse_float_list, default=None,
@@ -190,23 +205,49 @@ def main() -> None:
     k_zero = args.anchor_zero_k if args.anchor_zero_k is not None else args.k_mnn_grid[0]
     sim_zero = args.anchor_zero_sim if args.anchor_zero_sim is not None else args.anchor_sim_grid[0]
     margin_zero = args.anchor_zero_margin if args.anchor_zero_margin is not None else args.anchor_margin_grid[0]
+    lambda_adv_base_ratio_values = args.lambda_adv_base_ratio_grid if args.confidence_weighted else [0.0]
+    rho_target_values = args.rho_target_grid if args.confidence_weighted else [0.0]
 
-    grid: list[tuple[float, float, float, int, float, float]] = []
+    grid: list[tuple] = []
     if args.collapse_anchor_zero:
-        for lambda_adv, lambda_anchor, lambda_prior_diff in itertools.product(
+        for lambda_adv, lambda_anchor, lambda_prior_diff, lambda_adv_base_ratio, rho_target in itertools.product(
             args.lambda_adv_grid,
             args.lambda_anchor_grid,
             lambda_prior_diff_values,
+            lambda_adv_base_ratio_values,
+            rho_target_values,
         ):
             if lambda_anchor <= 0.0:
-                grid.append((lambda_adv, lambda_anchor, lambda_prior_diff, k_zero, sim_zero, margin_zero))
+                grid.append(
+                    (
+                        lambda_adv,
+                        lambda_anchor,
+                        lambda_prior_diff,
+                        lambda_adv_base_ratio,
+                        rho_target,
+                        k_zero,
+                        sim_zero,
+                        margin_zero,
+                    )
+                )
             else:
                 for k_mnn, sim_th, margin in itertools.product(
                     args.k_mnn_grid,
                     args.anchor_sim_grid,
                     args.anchor_margin_grid,
                 ):
-                    grid.append((lambda_adv, lambda_anchor, lambda_prior_diff, k_mnn, sim_th, margin))
+                    grid.append(
+                        (
+                            lambda_adv,
+                            lambda_anchor,
+                            lambda_prior_diff,
+                            lambda_adv_base_ratio,
+                            rho_target,
+                            k_mnn,
+                            sim_th,
+                            margin,
+                        )
+                    )
         grid = dedup_grid(grid)
     else:
         grid = list(
@@ -214,6 +255,8 @@ def main() -> None:
                 args.lambda_adv_grid,
                 args.lambda_anchor_grid,
                 lambda_prior_diff_values,
+                lambda_adv_base_ratio_values,
+                rho_target_values,
                 args.k_mnn_grid,
                 args.anchor_sim_grid,
                 args.anchor_margin_grid,
@@ -230,13 +273,26 @@ def main() -> None:
     print(f"Total configs: {len(grid)}")
 
     all_rows: list[dict] = []
-    for run_idx, (lambda_adv, lambda_anchor, lambda_prior_diff, k_mnn, sim_th, margin) in enumerate(grid, start=1):
+    for run_idx, (
+        lambda_adv,
+        lambda_anchor,
+        lambda_prior_diff,
+        lambda_adv_base_ratio,
+        rho_target,
+        k_mnn,
+        sim_th,
+        margin,
+    ) in enumerate(grid, start=1):
         cfg = dict(
             latent_backend=args.latent_backend,
+            confidence_weighted=args.confidence_weighted,
+            gate_mode=args.gate_mode if args.confidence_weighted else "none",
             lambda_adv=lambda_adv,
             lambda_anchor=lambda_anchor,
             lambda_prior_diff=lambda_prior_diff,
             lambda_diff=lambda_prior_diff,
+            lambda_adv_base_ratio=lambda_adv_base_ratio,
+            rho_target=rho_target,
             k_mnn=k_mnn,
             anchor_sim_threshold=sim_th,
             anchor_margin=margin,
@@ -280,6 +336,24 @@ def main() -> None:
                 "--valid-prop", str(args.valid_prop),
                 "--patience", str(args.patience),
             ]
+            if args.confidence_weighted:
+                train_cmd.extend(
+                    [
+                        "--confidence-weighted",
+                        "--gate-mode", args.gate_mode,
+                        "--cw-adv-ramp-epochs", str(args.cw_adv_ramp_epochs),
+                        "--gate-ramp-epochs", str(args.gate_ramp_epochs),
+                        "--lambda-adv-base-ratio", str(lambda_adv_base_ratio),
+                        "--rho-target", str(rho_target),
+                        "--w-floor", str(args.w_floor),
+                        "--w-orphan-min", str(args.w_orphan_min),
+                        "--rarity-boost", str(args.rarity_boost),
+                        "--orphan-sim-threshold", str(args.orphan_sim_threshold),
+                        "--orphan-margin-threshold", str(args.orphan_margin_threshold),
+                    ]
+                )
+                if args.gate_start_epoch is not None:
+                    train_cmd.extend(["--gate-start-epoch", str(args.gate_start_epoch)])
             if args.layer is not None:
                 train_cmd.extend(["--layer", args.layer])
             run_command(train_cmd)
@@ -314,10 +388,14 @@ def main() -> None:
         fieldnames = [
             "run_name",
             "latent_backend",
+            "confidence_weighted",
+            "gate_mode",
             "lambda_adv",
             "lambda_anchor",
             "lambda_prior_diff",
             "lambda_diff",
+            "lambda_adv_base_ratio",
+            "rho_target",
             "k_mnn",
             "anchor_sim_threshold",
             "anchor_margin",

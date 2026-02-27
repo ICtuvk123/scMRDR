@@ -118,6 +118,31 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--gamma", type=float, default=5.0)
     parser.add_argument("--lambda-adv", type=float, default=5.0)
+    parser.add_argument("--confidence-weighted", action="store_true",
+                        help="Enable confidence-weighted adversarial training.")
+    parser.add_argument("--gate-mode", type=str, default="robust_adv",
+                        choices=["legacy", "robust_adv"],
+                        help="Gate backend when --confidence-weighted is enabled.")
+    parser.add_argument("--cw-adv-ramp-epochs", type=int, default=10,
+                        help="Epochs to ramp lambda_adv from 0 to target after warmup.")
+    parser.add_argument("--gate-start-epoch", type=int, default=None,
+                        help="Epoch to enable gated branch (default: equals --num-warmup).")
+    parser.add_argument("--gate-ramp-epochs", type=int, default=10,
+                        help="Epochs to ramp gated branch weight.")
+    parser.add_argument("--lambda-adv-base-ratio", type=float, default=0.35,
+                        help="Base-branch ratio in dual-branch adversarial loss.")
+    parser.add_argument("--rho-target", type=float, default=0.65,
+                        help="Target keep ratio for robust gate budget control.")
+    parser.add_argument("--w-floor", type=float, default=0.15,
+                        help="Minimum adversarial sample weight.")
+    parser.add_argument("--w-orphan-min", type=float, default=0.45,
+                        help="Minimum weight for orphan samples in robust gate.")
+    parser.add_argument("--rarity-boost", type=float, default=0.10,
+                        help="Rare-modality additive boost in robust gate.")
+    parser.add_argument("--orphan-sim-threshold", type=float, default=0.15,
+                        help="Top1 cross-modal similarity threshold to mark orphan samples.")
+    parser.add_argument("--orphan-margin-threshold", type=float, default=0.02,
+                        help="Top1-top2 margin threshold to mark orphan samples.")
     parser.add_argument("--dropout-rate", type=float, default=0.2)
     parser.add_argument("--latent-backend", type=str, default="vae", choices=["vae", "diffusion"])
     parser.add_argument("--lambda-prior-diff", type=float, default=None,
@@ -256,6 +281,15 @@ def main() -> None:
         beta=args.beta,
         gamma=args.gamma,
         lambda_adv=args.lambda_adv,
+        confidence_weighted=args.confidence_weighted,
+        gate_mode=args.gate_mode,
+        cw_w_min=args.w_floor,
+        lambda_adv_base_ratio=args.lambda_adv_base_ratio,
+        rho_target=args.rho_target,
+        w_orphan_min=args.w_orphan_min,
+        rarity_boost=args.rarity_boost,
+        orphan_sim_threshold=args.orphan_sim_threshold,
+        orphan_margin_threshold=args.orphan_margin_threshold,
         dropout_rate=args.dropout_rate,
         linked_features=linked_features,
         latent_backend=args.latent_backend,
@@ -276,6 +310,9 @@ def main() -> None:
         early_stopping=not args.no_early_stopping,
         valid_prop=args.valid_prop,
         patience=args.patience,
+        cw_adv_ramp_epochs=args.cw_adv_ramp_epochs,
+        gate_start_epoch=args.gate_start_epoch,
+        gate_ramp_epochs=args.gate_ramp_epochs,
         lambda_anchor=args.lambda_anchor,
         k_mnn=args.k_mnn,
         anchor_space=args.anchor_space,

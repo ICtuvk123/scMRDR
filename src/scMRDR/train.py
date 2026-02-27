@@ -5,6 +5,11 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 from .anchor import find_mnn_pairs, find_mnn_pairs_latent, anchor_loss
 
+
+def _log_modality_scalars(writer, prefix, values, global_step):
+    for mod_idx, value in values.items():
+        writer.add_scalar(f"{prefix}/m{mod_idx}", value, global_step)
+
 class EarlyStopping:
     '''
     Early stopping for training.
@@ -49,10 +54,15 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 num_batch, lr, accumulation_steps=1, num_warmup = 0, adaptlr = False, early_stopping=True, patience=25,
                 sample_weights=None,
                 confidence_weighted=False,
+                gate_mode="robust_adv",
                 cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
                 cw_tau_min=0.01, cw_tau_max=2.0, cw_tau_fallback=0.5,
                 cw_eta=0.9, cw_rho=0.5, cw_tau_w=0.1, cw_w_min=0.1,
                 cw_min_count=8, cw_adv_ramp_epochs=10, cw_lambda_target=None,
+                gate_start_epoch=None, gate_ramp_epochs=10,
+                lambda_adv_base_ratio=0.35, rho_target=0.65,
+                w_orphan_min=0.45, rarity_boost=0.10,
+                orphan_sim_threshold=0.15, orphan_margin_threshold=0.02,
                 lambda_anchor=0.0, k_mnn=30, linked_feature_idx=None,
                 anchor_space="latent", anchor_start_epoch=0,
                 anchor_ramp_epochs=0, anchor_sim_threshold=0.0,
@@ -76,6 +86,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         patience: patience for early stopping
         sample_weights: sample weights for weighted sampling
         confidence_weighted: whether to use confidence-weighted adversarial training
+        gate_mode: "legacy" or "robust_adv"
         cw_*: confidence weighting hyperparameters
     '''
     # load data
@@ -113,20 +124,39 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
     # Confidence-weighted adversarial training setup
     cw = None
     if confidence_weighted:
-        from .confidence import ConfidenceWeighter
-        cw = ConfidenceWeighter(
-            latent_dim=model.latent_dim_shared,
-            num_modalities=model.modality_num,
-            device=device,
-            queue_size=cw_queue_size, alpha=cw_alpha,
-            c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
-            tau_fallback=cw_tau_fallback, eta=cw_eta,
-            rho=cw_rho, tau_w=cw_tau_w, w_min=cw_w_min,
-            min_count=cw_min_count,
-        )
+        from .confidence import ConfidenceWeighter, RobustAdvGate
+        if gate_mode == "legacy":
+            cw = ConfidenceWeighter(
+                latent_dim=model.latent_dim_shared,
+                num_modalities=model.modality_num,
+                device=device,
+                queue_size=cw_queue_size, alpha=cw_alpha,
+                c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
+                tau_fallback=cw_tau_fallback, eta=cw_eta,
+                rho=cw_rho, tau_w=cw_tau_w, w_min=cw_w_min,
+                min_count=cw_min_count,
+            )
+        elif gate_mode == "robust_adv":
+            cw = RobustAdvGate(
+                latent_dim=model.latent_dim_shared,
+                num_modalities=model.modality_num,
+                device=device,
+                queue_size=cw_queue_size, alpha=cw_alpha,
+                c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
+                tau_fallback=cw_tau_fallback, eta=cw_eta,
+                tau_w=cw_tau_w, min_count=cw_min_count,
+                rho_target=rho_target, w_floor=cw_w_min,
+                w_orphan_min=w_orphan_min, rarity_boost=rarity_boost,
+                orphan_sim_threshold=orphan_sim_threshold,
+                orphan_margin_threshold=orphan_margin_threshold,
+            )
+        else:
+            raise ValueError(f"Unsupported gate_mode: {gate_mode}")
         lambda_target = cw_lambda_target if cw_lambda_target is not None else model.lambda_adv
         T_w = num_warmup
         T_r = cw_adv_ramp_epochs
+        if gate_start_epoch is None:
+            gate_start_epoch = num_warmup
 
     for epoch in range(epoch_num):
         # Anchor ramp: Phase A (no anchor) -> Phase B (ramp up)
@@ -233,15 +263,40 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                     per_sample_adv = loss_dict['_per_sample_adv']
                     modality_labels_batch = torch.argmax(m, dim=1)
 
-                    adv_weights = cw.compute_weights(z_shared_batch, modality_labels_batch, logits_batch)
-                    cw.update_queues(z_shared_batch.detach(), modality_labels_batch)
-
                     # Lambda ramp
                     ramp = min(1.0, max(0.0, (epoch - T_w) / T_r)) if T_r > 0 else 1.0
                     lambda_adv_current = lambda_target * ramp
 
-                    adv_loss_weighted = (adv_weights * per_sample_adv).sum() / m.shape[0]
-                    loss = base_loss + lambda_adv_current * adv_loss_weighted
+                    if gate_mode == "robust_adv":
+                        gate_info = cw.compute_weights(z_shared_batch, modality_labels_batch, logits_batch)
+                        adv_weights = gate_info["weights"]
+                        cw.update_queues(z_shared_batch.detach(), modality_labels_batch)
+
+                        base_ratio = min(max(lambda_adv_base_ratio, 0.0), 1.0)
+                        lambda_adv_base = lambda_adv_current * base_ratio
+                        gate_lambda_full = lambda_adv_current * (1.0 - base_ratio)
+                        if epoch < gate_start_epoch:
+                            gate_ramp = 0.0
+                        else:
+                            gate_ramp = (
+                                min(1.0, (epoch - gate_start_epoch) / gate_ramp_epochs)
+                                if gate_ramp_epochs > 0 else 1.0
+                            )
+                        lambda_adv_gate = gate_lambda_full * gate_ramp
+
+                        adv_loss_base = per_sample_adv.sum() / m.shape[0]
+                        adv_loss_weighted = (adv_weights * per_sample_adv).sum() / m.shape[0]
+                        adv_total = lambda_adv_base * adv_loss_base + lambda_adv_gate * adv_loss_weighted
+                        loss = base_loss + adv_total
+                        loss_dict_adv_val = adv_total.item()
+                        adv_base_val = adv_loss_base.item()
+                        adv_gate_val = adv_loss_weighted.item()
+                    else:
+                        adv_weights = cw.compute_weights(z_shared_batch, modality_labels_batch, logits_batch)
+                        cw.update_queues(z_shared_batch.detach(), modality_labels_batch)
+                        adv_loss_weighted = (adv_weights * per_sample_adv).sum() / m.shape[0]
+                        loss = base_loss + lambda_adv_current * adv_loss_weighted
+                        loss_dict_adv_val = (lambda_adv_current * adv_loss_weighted).item()
 
                     # Anchor loss (MNN pairs)
                     a_loss_val = 0.0
@@ -268,7 +323,6 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                         optimizer_vae.zero_grad()
 
                     # Logging
-                    loss_dict_adv_val = adv_loss_weighted.item()
                     total_loss += loss.item()
                     recon_loss += loss_dict['recon_loss']
                     kl_z += loss_dict['kl_z']
@@ -289,6 +343,29 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                         writer.add_scalar("mean_adv_weight/train", adv_weights.mean().item(), global_step)
                         writer.add_scalar("min_adv_weight/train", adv_weights.min().item(), global_step)
                         writer.add_scalar("tau_nn/train", cw.current_tau_nn, global_step)
+                        if gate_mode == "robust_adv":
+                            writer.add_scalar("tau_h/train", cw.current_tau_h, global_step)
+                            writer.add_scalar("adv_base_unscaled/train", adv_base_val, global_step)
+                            writer.add_scalar("adv_gate_unscaled/train", adv_gate_val, global_step)
+                            writer.add_scalar("lambda_adv_gate/train", lambda_adv_gate, global_step)
+                            _log_modality_scalars(
+                                writer,
+                                "mean_adv_weight_by_modality/train",
+                                cw.current_mean_weight_by_modality,
+                                global_step,
+                            )
+                            _log_modality_scalars(
+                                writer,
+                                "orphan_ratio_by_modality/train",
+                                cw.current_orphan_ratio_by_modality,
+                                global_step,
+                            )
+                            _log_modality_scalars(
+                                writer,
+                                "gate_threshold_by_modality/train",
+                                cw.current_modality_thresholds,
+                                global_step,
+                            )
                         writer.add_scalar("anchor_Loss/train", a_loss_val, global_step)
                 else:
                     # Original adversarial training (no confidence weighting)
