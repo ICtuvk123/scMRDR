@@ -103,7 +103,15 @@ def main() -> None:
     parser.add_argument("--label-key", type=str, default="celltype")
     parser.add_argument("--embedding-key", type=str, default="latent_shared")
     parser.add_argument("--anchor-space", type=str, default="raw", choices=["raw", "latent"])
-    parser.add_argument("--linked-features-uns-key", type=str, default="linked_features")
+    parser.add_argument(
+        "--linked-features-uns-key",
+        type=str,
+        default=None,
+        help=(
+            "Optional adata.uns key for linked features used by raw-space anchor pairing. "
+            "If omitted, train script falls back to auto-linked features."
+        ),
+    )
     parser.add_argument("--distribution", type=str, default="ZINB")
     parser.add_argument("--layer", type=str, default=None)
     parser.add_argument("--latent-backend", type=str, default="vae", choices=["vae", "diffusion"])
@@ -315,7 +323,6 @@ def main() -> None:
                 "--batch-key", args.batch_key,
                 "--distribution", args.distribution,
                 "--anchor-space", args.anchor_space,
-                "--linked-features-uns-key", args.linked_features_uns_key,
                 "--latent-backend", args.latent_backend,
                 "--lambda-adv", str(lambda_adv),
                 "--lambda-anchor", str(lambda_anchor),
@@ -336,6 +343,8 @@ def main() -> None:
                 "--valid-prop", str(args.valid_prop),
                 "--patience", str(args.patience),
             ]
+            if args.linked_features_uns_key is not None:
+                train_cmd.extend(["--linked-features-uns-key", args.linked_features_uns_key])
             if args.confidence_weighted:
                 train_cmd.extend(
                     [
