@@ -1,0 +1,35 @@
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/anndata/_core/anndata.py:1796: UserWarning: Observation names are not unique. To make them unique, call `.obs_names_make_unique`.
+  utils.warn_names_duplicates("obs")
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/scanpy/preprocessing/_pca/__init__.py:226: FutureWarning: Argument `use_highly_variable` is deprecated, consider using the mask argument. Use_highly_variable=True can be called through mask_var="highly_variable". Use_highly_variable=False can be called through mask_var=None
+  mask_var_param, mask_var = _handle_mask_var(
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/anndata/_core/anndata.py:1796: UserWarning: Observation names are not unique. To make them unique, call `.obs_names_make_unique`.
+  utils.warn_names_duplicates("obs")
+Computing neighbors:   0%|          | 0/1 [00:00<?, ?it/s]Computing neighbors: 100%|██████████| 1/1 [01:03<00:00, 63.71s/it]Computing neighbors: 100%|██████████| 1/1 [01:03<00:00, 63.71s/it]
+Embeddings:   0%|[32m          [0m| 0/1 [00:00<?, ?it/s]
+Metrics:   0%|[34m          [0m| 0/14 [00:00<?, ?it/s][A
+Metrics:   0%|[34m          [0m| 0/14 [00:00<?, ?it/s, Bio conservation: isolated_labels][AWARNING:2026-03-02 14:10:53,662:jax._src.xla_bridge:876: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+Embeddings:   0%|[32m          [0m| 0/1 [01:58<?, ?it/s]
+Traceback (most recent call last):
+  File "/root/rivermind-data/scMRDR/experiments/plots/metrics.py", line 516, in <module>
+    run_local_bmmc_metrics(
+  File "/root/rivermind-data/scMRDR/experiments/plots/metrics.py", line 481, in run_local_bmmc_metrics
+    bm2.benchmark()
+  File "/root/rivermind-data/scMRDR/experiments/plots/metrics.py", line 268, in benchmark
+    metric_value = getattr(MetricAnnDataAPI2, metric_name)(ad, metric_fn)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/rivermind-data/scMRDR/experiments/plots/metrics.py", line 118, in <lambda>
+    isolated_labels = lambda ad, fn: fn(ad.X, ad.obs[_LABELS], ad.obs[_MODALITY])
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/scMRDR/lib/python3.11/site-packages/scib_metrics/metrics/_isolated_labels.py", line 48, in isolated_labels
+    silhouette_all = silhouette_samples(X, labels)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/scMRDR/lib/python3.11/site-packages/scib_metrics/utils/_silhouette.py", line 150, in silhouette_samples
+    results = _pairwise_distances_chunked(X, chunk_size=chunk_size, reduce_fn=reduce_fn, metric=metric)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/conda/envs/scMRDR/lib/python3.11/site-packages/scib_metrics/utils/_silhouette.py", line 99, in _pairwise_distances_chunked
+    intra_cluster_dists, inter_cluster_dists = reduce_fn(cdist(X[start:end], X, metric=metric), start=start)
+                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+
+                                                                                  [A

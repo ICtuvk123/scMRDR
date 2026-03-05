@@ -1,0 +1,79 @@
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/anndata/_core/anndata.py:1796: UserWarning: Observation names are not unique. To make them unique, call `.obs_names_make_unique`.
+  utils.warn_names_duplicates("obs")
+Global seed set to 0 (deterministic=False)
+Loading data: experiments/BMMC_codes/feature_aligned.h5ad
+Discriminator CE random baseline (log K): 1.0986 (K=3)
+feature_list disabled (feature_list=None).
+linked_features loaded from file experiments/BMMC_codes/linked_features_160.txt: 160 entries
+using cuda
+Linked features for MNN anchor: 160 features
+Training start!
+Anchor config: space=raw, start_epoch=20, ramp_epochs=30, lambda=0.2
+  Confidence filters: sim_threshold=0.06, margin=0.012
+epoch 1: loss = 1000.7768, Recon = 973.1622, KL = 16.8247, preserve = 0.2762, adv = -2.4719, discri = 0.4966, anchor = 0.0000
+epoch 2: loss = 936.3815, Recon = 922.8308, KL = 7.8913, preserve = 0.0303, adv = -0.7944, discri = 0.8187, anchor = 0.0000
+epoch 3: loss = 922.7778, Recon = 909.6470, KL = 7.7227, preserve = 0.0264, adv = -0.8155, discri = 0.8361, anchor = 0.0000
+epoch 4: loss = 916.3199, Recon = 903.2966, KL = 7.6925, preserve = 0.0212, adv = -0.8225, discri = 0.8381, anchor = 0.0000
+epoch 5: loss = 912.4684, Recon = 899.4938, KL = 7.6932, preserve = 0.0200, adv = -0.8373, discri = 0.8496, anchor = 0.0000
+epoch 6: loss = 910.1413, Recon = 897.2169, KL = 7.6847, preserve = 0.0180, adv = -0.8450, discri = 0.8557, anchor = 0.0000
+epoch 7: loss = 908.5242, Recon = 895.6454, KL = 7.6775, preserve = 0.0165, adv = -0.8529, discri = 0.8624, anchor = 0.0000
+epoch 8: loss = 907.1883, Recon = 894.3687, KL = 7.6590, preserve = 0.0153, adv = -0.8583, discri = 0.8647, anchor = 0.0000
+epoch 9: loss = 906.3160, Recon = 893.5124, KL = 7.6578, preserve = 0.0144, adv = -0.8613, discri = 0.8679, anchor = 0.0000
+epoch 10: loss = 905.6174, Recon = 892.8061, KL = 7.6636, preserve = 0.0151, adv = -0.8638, discri = 0.8710, anchor = 0.0000
+epoch 11: loss = 904.9101, Recon = 892.1178, KL = 7.6626, preserve = 0.0133, adv = -0.8664, discri = 0.8717, anchor = 0.0000
+epoch 12: loss = 904.4137, Recon = 891.6654, KL = 7.6464, preserve = 0.0123, adv = -0.8686, discri = 0.8752, anchor = 0.0000
+epoch 13: loss = 904.0496, Recon = 891.2874, KL = 7.6554, preserve = 0.0122, adv = -0.8698, discri = 0.8746, anchor = 0.0000
+epoch 14: loss = 903.6408, Recon = 890.8893, KL = 7.6537, preserve = 0.0117, adv = -0.8715, discri = 0.8765, anchor = 0.0000
+epoch 15: loss = 903.3563, Recon = 890.5733, KL = 7.6702, preserve = 0.0117, adv = -0.8720, discri = 0.8774, anchor = 0.0000
+epoch 16: loss = 902.9463, Recon = 890.1649, KL = 7.6728, preserve = 0.0110, adv = -0.8730, discri = 0.8785, anchor = 0.0000
+EarlyStopping counter: 1 / 4
+epoch 17: loss = 902.8499, Recon = 890.0865, KL = 7.6668, preserve = 0.0107, adv = -0.8746, discri = 0.8798, anchor = 0.0000
+epoch 18: loss = 902.4679, Recon = 889.6851, KL = 7.6787, preserve = 0.0106, adv = -0.8758, discri = 0.8804, anchor = 0.0000
+EarlyStopping counter: 1 / 4
+epoch 19: loss = 902.2090, Recon = 889.4543, KL = 7.6670, preserve = 0.0101, adv = -0.8766, discri = 0.8810, anchor = 0.0000
+epoch 20: loss = 902.0267, Recon = 889.2743, KL = 7.6676, preserve = 0.0099, adv = -0.8775, discri = 0.8813, anchor = 0.0000
+epoch 21: loss = 901.7827, Recon = 889.0503, KL = 7.6593, preserve = 0.0098, adv = -0.8783, discri = 0.8830, anchor = 0.0000
+epoch 22: loss = 901.6035, Recon = 888.8400, KL = 7.6509, preserve = 0.0098, adv = -0.8773, discri = 0.8839, anchor = 6.7271
+epoch 23: loss = 901.6809, Recon = 888.8791, KL = 7.6519, preserve = 0.0092, adv = -0.8788, discri = 0.8830, anchor = 6.6486
+EarlyStopping counter: 1 / 4
+epoch 24: loss = 901.3976, Recon = 888.5539, KL = 7.6512, preserve = 0.0094, adv = -0.8792, discri = 0.8846, anchor = 6.5972
+epoch 25: loss = 901.2145, Recon = 888.3525, KL = 7.6409, preserve = 0.0091, adv = -0.8799, discri = 0.8846, anchor = 6.5289
+epoch 26: loss = 901.2192, Recon = 888.3013, KL = 7.6462, preserve = 0.0090, adv = -0.8783, discri = 0.8834, anchor = 6.4621
+EarlyStopping counter: 1 / 4
+epoch 27: loss = 901.2062, Recon = 888.2704, KL = 7.6385, preserve = 0.0089, adv = -0.8805, discri = 0.8842, anchor = 6.3937
+EarlyStopping counter: 2 / 4
+epoch 28: loss = 901.0500, Recon = 888.0818, KL = 7.6329, preserve = 0.0088, adv = -0.8789, discri = 0.8846, anchor = 6.3247
+epoch 29: loss = 900.9354, Recon = 887.9190, KL = 7.6384, preserve = 0.0087, adv = -0.8792, discri = 0.8849, anchor = 6.2622
+epoch 30: loss = 900.9258, Recon = 887.9042, KL = 7.6226, preserve = 0.0088, adv = -0.8796, discri = 0.8844, anchor = 6.1912
+epoch 31: loss = 900.6806, Recon = 887.6413, KL = 7.6143, preserve = 0.0084, adv = -0.8798, discri = 0.8826, anchor = 6.1262
+epoch 32: loss = 900.7532, Recon = 887.6659, KL = 7.6165, preserve = 0.0086, adv = -0.8774, discri = 0.8837, anchor = 6.0467
+epoch 33: loss = 900.6643, Recon = 887.5414, KL = 7.6203, preserve = 0.0082, adv = -0.8792, discri = 0.8838, anchor = 5.9872
+epoch 34: loss = 900.5110, Recon = 887.3554, KL = 7.6184, preserve = 0.0083, adv = -0.8801, discri = 0.8845, anchor = 5.9752
+EarlyStopping counter: 1 / 4
+epoch 35: loss = 900.5696, Recon = 887.3794, KL = 7.6181, preserve = 0.0082, adv = -0.8790, discri = 0.8832, anchor = 5.8939
+epoch 36: loss = 900.5967, Recon = 887.4029, KL = 7.6078, preserve = 0.0080, adv = -0.8812, discri = 0.8844, anchor = 5.8217
+EarlyStopping counter: 1 / 4
+epoch 37: loss = 900.4004, Recon = 887.1562, KL = 7.6124, preserve = 0.0080, adv = -0.8789, discri = 0.8839, anchor = 5.7775
+EarlyStopping counter: 2 / 4
+epoch 38: loss = 900.3590, Recon = 887.1100, KL = 7.6038, preserve = 0.0079, adv = -0.8813, discri = 0.8848, anchor = 5.7000
+epoch 39: loss = 900.3044, Recon = 887.0275, KL = 7.6025, preserve = 0.0074, adv = -0.8811, discri = 0.8854, anchor = 5.6503
+epoch 40: loss = 900.2801, Recon = 886.9590, KL = 7.6056, preserve = 0.0077, adv = -0.8798, discri = 0.8848, anchor = 5.6104
+EarlyStopping counter: 1 / 4
+epoch 41: loss = 900.2720, Recon = 886.9440, KL = 7.5971, preserve = 0.0076, adv = -0.8809, discri = 0.8848, anchor = 5.5386
+epoch 42: loss = 900.2460, Recon = 886.8858, KL = 7.5952, preserve = 0.0076, adv = -0.8807, discri = 0.8850, anchor = 5.5272
+EarlyStopping counter: 1 / 4
+epoch 43: loss = 900.2431, Recon = 886.8649, KL = 7.5927, preserve = 0.0076, adv = -0.8811, discri = 0.8846, anchor = 5.4412
+epoch 44: loss = 900.1748, Recon = 886.7672, KL = 7.5915, preserve = 0.0076, adv = -0.8804, discri = 0.8860, anchor = 5.4000
+epoch 45: loss = 900.1753, Recon = 886.7254, KL = 7.6014, preserve = 0.0074, adv = -0.8809, discri = 0.8859, anchor = 5.3314
+EarlyStopping counter: 1 / 4
+epoch 46: loss = 900.1564, Recon = 886.6782, KL = 7.6001, preserve = 0.0074, adv = -0.8812, discri = 0.8839, anchor = 5.3059
+EarlyStopping counter: 2 / 4
+epoch 47: loss = 900.0142, Recon = 886.5359, KL = 7.5881, preserve = 0.0074, adv = -0.8824, discri = 0.8859, anchor = 5.2638
+EarlyStopping counter: 3 / 4
+epoch 48: loss = 900.1685, Recon = 886.6298, KL = 7.6023, preserve = 0.0073, adv = -0.8805, discri = 0.8851, anchor = 5.2163
+EarlyStopping counter: 4 / 4
+Early stopping at epoch 48
+Training finished!
+inference: loss = 891.3121, Recon_loss = 879.2661, KL_loss = 7.2658, preserve_loss = 0.0162, adv_loss = -0.8555
+All results recorded in adata.
+Saved: experiments/BMMC_codes/anchor_refine_adv3_0_la0_20_k10_st20_sim0_06_m0_012_full_quickgrid_v1_bs256.h5ad

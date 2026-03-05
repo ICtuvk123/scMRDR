@@ -1,0 +1,55 @@
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/anndata/_core/anndata.py:1796: UserWarning: Observation names are not unique. To make them unique, call `.obs_names_make_unique`.
+  utils.warn_names_duplicates("obs")
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/scanpy/preprocessing/_pca/__init__.py:226: FutureWarning: Argument `use_highly_variable` is deprecated, consider using the mask argument. Use_highly_variable=True can be called through mask_var="highly_variable". Use_highly_variable=False can be called through mask_var=None
+  mask_var_param, mask_var = _handle_mask_var(
+/opt/conda/envs/scMRDR/lib/python3.11/site-packages/anndata/_core/anndata.py:1796: UserWarning: Observation names are not unique. To make them unique, call `.obs_names_make_unique`.
+  utils.warn_names_duplicates("obs")
+Computing neighbors:   0%|          | 0/1 [00:00<?, ?it/s]Computing neighbors: 100%|██████████| 1/1 [01:04<00:00, 64.39s/it]Computing neighbors: 100%|██████████| 1/1 [01:04<00:00, 64.39s/it]
+Embeddings:   0%|[32m          [0m| 0/1 [00:00<?, ?it/s]
+Metrics:   0%|[34m          [0m| 0/14 [00:00<?, ?it/s][A
+Metrics:   0%|[34m          [0m| 0/14 [00:00<?, ?it/s, Bio conservation: isolated_labels][AWARNING:2026-03-02 12:17:34,544:jax._src.xla_bridge:876: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+
+Metrics:   7%|[34m▋         [0m| 1/14 [05:06<1:06:26, 306.66s/it, Bio conservation: isolated_labels][A
+Metrics:   7%|[34m▋         [0m| 1/14 [05:06<1:06:26, 306.66s/it, Bio conservation: nmi_ari_cluster_labels_kmeans][A
+Metrics:  14%|[34m█▍        [0m| 2/14 [05:13<26:03, 130.28s/it, Bio conservation: nmi_ari_cluster_labels_kmeans]  [A
+Metrics:  14%|[34m█▍        [0m| 2/14 [05:13<26:03, 130.28s/it, Bio conservation: silhouette_label]             [A
+Metrics:  21%|[34m██▏       [0m| 3/14 [09:25<34:06, 186.04s/it, Bio conservation: silhouette_label][A
+Metrics:  21%|[34m██▏       [0m| 3/14 [09:25<34:06, 186.04s/it, Bio conservation: clisi_knn]       [A
+Metrics:  29%|[34m██▊       [0m| 4/14 [09:27<18:52, 113.23s/it, Bio conservation: clisi_knn][A
+Metrics:  29%|[34m██▊       [0m| 4/14 [09:27<18:52, 113.23s/it, Batch correction: silhouette_batch_b][A
+Metrics:  36%|[34m███▌      [0m| 5/14 [10:10<13:10, 87.79s/it, Batch correction: silhouette_batch_b] [A
+Metrics:  36%|[34m███▌      [0m| 5/14 [10:10<13:10, 87.79s/it, Batch correction: ilisi_knn_b]       [A
+Metrics:  43%|[34m████▎     [0m| 6/14 [10:11<07:46, 58.35s/it, Batch correction: ilisi_knn_b][A
+Metrics:  43%|[34m████▎     [0m| 6/14 [10:11<07:46, 58.35s/it, Batch correction: kbet_per_label_b][A
+Metrics:  50%|[34m█████     [0m| 7/14 [15:49<17:29, 149.89s/it, Batch correction: kbet_per_label_b][A
+Metrics:  50%|[34m█████     [0m| 7/14 [15:49<17:29, 149.89s/it, Batch correction: pcr_comparison_b][A
+Metrics:  57%|[34m█████▋    [0m| 8/14 [15:51<10:16, 102.71s/it, Batch correction: pcr_comparison_b][A
+Metrics:  57%|[34m█████▋    [0m| 8/14 [15:51<10:16, 102.71s/it, Modality integration: silhouette_batch_m][A
+Metrics:  64%|[34m██████▍   [0m| 9/14 [16:24<06:44, 80.87s/it, Modality integration: silhouette_batch_m] [A
+Metrics:  64%|[34m██████▍   [0m| 9/14 [16:24<06:44, 80.87s/it, Modality integration: ilisi_knn_m]       [A
+Metrics:  71%|[34m███████▏  [0m| 10/14 [16:25<03:45, 56.26s/it, Modality integration: ilisi_knn_m][A
+Metrics:  71%|[34m███████▏  [0m| 10/14 [16:25<03:45, 56.26s/it, Modality integration: kbet_per_label_m][A
+Metrics:  79%|[34m███████▊  [0m| 11/14 [21:54<06:59, 139.87s/it, Modality integration: kbet_per_label_m][A
+Metrics:  79%|[34m███████▊  [0m| 11/14 [21:54<06:59, 139.87s/it, Modality integration: graph_connectivity][A/opt/conda/envs/scMRDR/lib/python3.11/site-packages/scib_metrics/metrics/_graph_connectivity.py:32: FutureWarning: pandas.value_counts is deprecated and will be removed in a future version. Use pd.Series(obj).value_counts() instead.
+  tab = pd.value_counts(comps)
+
+Metrics:  86%|[34m████████▌ [0m| 12/14 [21:55<03:14, 97.46s/it, Modality integration: graph_connectivity] [A
+Metrics:  86%|[34m████████▌ [0m| 12/14 [21:55<03:14, 97.46s/it, Modality integration: pcr_comparison_m]  [A
+Metrics:  93%|[34m█████████▎[0m| 13/14 [21:56<01:08, 68.29s/it, Modality integration: pcr_comparison_m][AEmbeddings: 100%|[32m██████████[0m| 1/1 [21:56<00:00, 1316.47s/it]Embeddings: 100%|[32m██████████[0m| 1/1 [21:56<00:00, 1316.47s/it]
+
+                                                                                                [A/root/rivermind-data/scMRDR/experiments/plots/metrics.py:327: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise an error in a future version of pandas. Value 'Aggregate score' has dtype incompatible with float64, please explicitly cast to a compatible dtype first.
+  df.loc[_METRIC_TYPE, per_class_score.columns] = _AGGREGATE_SCORE
+/root/rivermind-data/scMRDR/experiments/plots/metrics.py:327: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise an error in a future version of pandas. Value 'Aggregate score' has dtype incompatible with float64, please explicitly cast to a compatible dtype first.
+  df.loc[_METRIC_TYPE, per_class_score.columns] = _AGGREGATE_SCORE
+/root/rivermind-data/scMRDR/experiments/plots/metrics.py:327: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise an error in a future version of pandas. Value 'Aggregate score' has dtype incompatible with float64, please explicitly cast to a compatible dtype first.
+  df.loc[_METRIC_TYPE, per_class_score.columns] = _AGGREGATE_SCORE
+/root/rivermind-data/scMRDR/experiments/plots/metrics.py:327: FutureWarning: Setting an item of incompatible dtype is deprecated and will raise an error in a future version of pandas. Value 'Aggregate score' has dtype incompatible with float64, please explicitly cast to a compatible dtype first.
+  df.loc[_METRIC_TYPE, per_class_score.columns] = _AGGREGATE_SCORE
+Batch correction         0.33534
+Modality integration    0.549199
+Bio conservation        0.684163
+Total                   0.539027
+Name: anchor_refine_adv3_0_la0_25_k10_st20_sim0_06_m0_012_full_quickgrid_v1_bs256, dtype: object
+Saved unscaled metrics: experiments/BMMC_codes/metrics_anchor_refine_adv3_0_la0_25_k10_st20_sim0_06_m0_012_full_quickgrid_v1_bs256/unscaled_metrics_local.csv
+Saved scaled metrics: experiments/BMMC_codes/metrics_anchor_refine_adv3_0_la0_25_k10_st20_sim0_06_m0_012_full_quickgrid_v1_bs256/scaled_metrics_local.csv

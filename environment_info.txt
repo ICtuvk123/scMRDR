@@ -1,0 +1,43 @@
+========================================
+Environment Snapshot
+Date: 2026-03-05
+========================================
+
+[Python]
+Python 3.11.14
+
+[Conda Environment]
+Active: scMRDR (/opt/conda/envs/scMRDR)
+Other envs: scMRDR_v1
+
+[GPU]
+NVIDIA GeForce RTX 3090, 24576 MiB
+Driver: 580.119.02
+
+[OS]
+Linux 5.15.0-161-generic (Ubuntu)
+Arch: x86_64
+
+[Key Packages]
+torch==2.3.1+cu121
+tensorflow==2.20.0
+scanpy==1.11.5
+anndata==0.12.6
+scib==1.1.7
+scib-metrics==0.5.8
+mudata==0.3.3
+muon==0.1.7
+optuna==4.6.0
+umap-learn==0.5.11
+scikit-learn==1.7.2
+scipy==1.16.3
+numpy==2.3.5
+pandas==2.3.3
+
+[Git]
+Branch: feat/robust-gate-adv
+Remote: git@github.com:ICtuvk123/scMRDR.git
+Latest commit: 5b8c3ae fix: make linked-features uns key optional in grid search
+
+[pip freeze → environment_freeze.txt]
+========================================

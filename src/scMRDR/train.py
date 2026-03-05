@@ -3,12 +3,37 @@ from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
+import os
 from .anchor import find_mnn_pairs, find_mnn_pairs_latent, anchor_loss
 
 
 def _log_modality_scalars(writer, prefix, values, global_step):
     for mod_idx, value in values.items():
         writer.add_scalar(f"{prefix}/m{mod_idx}", value, global_step)
+
+
+def _dataloader_kwargs(device):
+    """
+    Build robust DataLoader runtime kwargs.
+
+    Env overrides:
+      SCMRDR_NUM_WORKERS: int, default 2
+      SCMRDR_PIN_MEMORY: 0/1, default 1 on CUDA, 0 on CPU
+      SCMRDR_PERSISTENT_WORKERS: 0/1, default 1 when num_workers > 0
+    """
+    num_workers = int(os.getenv("SCMRDR_NUM_WORKERS", "2"))
+    pin_default = 1 if str(device).startswith("cuda") else 0
+    pin_memory = int(os.getenv("SCMRDR_PIN_MEMORY", str(pin_default))) == 1
+    persistent_default = 1 if num_workers > 0 else 0
+    persistent_workers = int(os.getenv("SCMRDR_PERSISTENT_WORKERS", str(persistent_default))) == 1
+
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+    return kwargs
 
 class EarlyStopping:
     '''
@@ -90,6 +115,7 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         cw_*: confidence weighting hyperparameters
     '''
     # load data
+    loader_kwargs = _dataloader_kwargs(device)
     if sample_weights is not None:
         sample_weights = torch.tensor(sample_weights,dtype=torch.double)
         sampler = WeightedRandomSampler(
@@ -97,9 +123,22 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
             num_samples=len(sample_weights),
             replacement=True
         )
-        train_data = DataLoader(train_dataset,batch_size,shuffle=False,sampler=sampler,drop_last=True,num_workers=4,pin_memory=True)
+        train_data = DataLoader(
+            train_dataset,
+            batch_size,
+            shuffle=False,
+            sampler=sampler,
+            drop_last=True,
+            **loader_kwargs,
+        )
     else:   
-        train_data = DataLoader(train_dataset,batch_size,shuffle=True,drop_last=True,num_workers=4,pin_memory=True)
+        train_data = DataLoader(
+            train_dataset,
+            batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
     # optimizer = optim.Adam(model.parameters(), lr=lr)
     if hasattr(model, "vae_parameters"):
         vae_params = list(model.vae_parameters())
@@ -449,7 +488,14 @@ def validate_model(device, validate_dataset, model, batch_size):
         batch_size: batch size
     '''
     model.eval()
-    validate_data = DataLoader(validate_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
+    loader_kwargs = _dataloader_kwargs(device)
+    validate_data = DataLoader(
+        validate_dataset,
+        batch_size,
+        shuffle=False,
+        drop_last=False,
+        **loader_kwargs,
+    )
     total_loss= 0
     with torch.no_grad():
         for _, (X,b,m,i,w) in enumerate(validate_data):
@@ -469,7 +515,14 @@ def inference_model(device, inference_dataset, model, batch_size):
         batch_size: batch size
     '''
     model.eval()
-    inference_data = DataLoader(inference_dataset,batch_size,shuffle=False,drop_last=False,num_workers=4,pin_memory=True)
+    loader_kwargs = _dataloader_kwargs(device)
+    inference_data = DataLoader(
+        inference_dataset,
+        batch_size,
+        shuffle=False,
+        drop_last=False,
+        **loader_kwargs,
+    )
     z1_list = []
     z2_list = []
     total_loss,recon_loss,kl_z,preserve_loss,adv_loss= \

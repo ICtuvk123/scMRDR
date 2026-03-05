@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+import os
+import random
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import scanpy as sc
+import torch
+
+# Support running this script directly from a src-layout repo checkout.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if SRC_DIR.is_dir():
+    sys.path.insert(0, str(SRC_DIR))
 
 from scMRDR.module import Integration
 
@@ -81,6 +91,27 @@ def parse_linked_feature_file(path: Path) -> list[Any]:
             except ValueError:
                 values.append(item)
     return values
+
+
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def main() -> None:
@@ -170,6 +201,12 @@ def main() -> None:
     parser.add_argument("--valid-prop", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--no-early-stopping", action="store_true")
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic backend settings (may reduce speed).",
+    )
     parser.add_argument("--lambda-anchor", type=float, default=0.0)
     parser.add_argument("--k-mnn", type=int, default=30)
     parser.add_argument("--anchor-space", type=str, default="latent", choices=["raw", "latent"],
@@ -202,6 +239,8 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    set_seed(args.seed, deterministic=args.deterministic)
+    print(f"Global seed set to {args.seed} (deterministic={args.deterministic})")
     lambda_prior_diff = args.lambda_prior_diff
     if lambda_prior_diff is None:
         lambda_prior_diff = args.lambda_diff if args.lambda_diff is not None else 1.0
@@ -310,6 +349,7 @@ def main() -> None:
         early_stopping=not args.no_early_stopping,
         valid_prop=args.valid_prop,
         patience=args.patience,
+        random_state=args.seed,
         cw_adv_ramp_epochs=args.cw_adv_ramp_epochs,
         gate_start_epoch=args.gate_start_epoch,
         gate_ramp_epochs=args.gate_ramp_epochs,
