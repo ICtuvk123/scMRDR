@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from .data import CombinedDataset
-from .model import EmbeddingNet
+from .model import EmbeddingNet, EmbeddingNetXAttn
 from .train import train_model, inference_model
 from sklearn.preprocessing import LabelEncoder,OneHotEncoder,StandardScaler
 import anndata as ad
@@ -130,6 +130,7 @@ class Integration:
 
     def setup(self, hidden_layers = [100,50], latent_dim_shared = 15, latent_dim_specific = 15, dropout_rate=0.5,
               beta = 2, gamma = 1, lambda_adv = 0.01, device=None,
+              encoder_covariates=False,
               confidence_weighted=False,
               gate_mode="robust_adv",
               cw_queue_size=4096, cw_alpha=0.5, cw_c_tau=1.0,
@@ -149,7 +150,25 @@ class Integration:
               diffusion_prior_cond="none",
               beta_specific=None,
               lambda_diff=None,
-              diffusion_cond=None):
+              diffusion_cond=None,
+              model_architecture="standard",
+              num_shared_tokens=4,
+              num_private_tokens=2,
+              token_dim=32,
+              num_shared_protos=2,
+              num_private_protos=2,
+              xattn_depth=2,
+              xattn_heads=4,
+              xattn_dim_head=32,
+              diff_hidden_dim=256,
+              diff_steps=100,
+              lambda_diff_recon=1.0,
+              lambda_token_orth=0.0,
+              lambda_private_cls=0.03,
+              adv_stop_frac=0.25,
+              support_ema_eta=0.9,
+              support_threshold=0.15,
+              support_min_updates=5):
         '''
         Setup the model.
         Args:
@@ -218,18 +237,52 @@ class Integration:
         else:
             self.device = device
         print("using "+str(self.device))
-        self.model = EmbeddingNet(self.device, self.input_dim, self.modality_num, self.covariates_dim, layer_dims=self.hidden_layers,
-                    latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,dropout_rate = self.dropout_rate,
-                    beta=self.beta, gamma = self.gamma, lambda_adv = self.lambda_adv,
-                    feat_mask = self.feat_mask, distribution = self.distribution,
-                    latent_backend=latent_backend,
-                    lambda_prior_diff=lambda_prior_diff,
-                    diffusion_steps=diffusion_steps,
-                    diffusion_hidden_dim=diffusion_hidden_dim,
-                    diffusion_time_embed_dim=diffusion_time_embed_dim,
-                    diffusion_beta_schedule=diffusion_beta_schedule,
-                    diffusion_prior_cond=diffusion_prior_cond,
-                    beta_specific=beta_specific).to(self.device)
+        self.model_architecture = model_architecture
+        if self.model_architecture == "xattn" and self.distribution not in {"ZINB", "NB"}:
+            raise ValueError(
+                "model_architecture='xattn' in V1 requires a count-style distribution "
+                "compatible with log1p inputs: {'ZINB', 'NB'}."
+            )
+        if self.model_architecture == "standard":
+            self.model = EmbeddingNet(
+                self.device, self.input_dim, self.modality_num, self.covariates_dim,
+                celltype_num=self.celltype_num, layer_dims=self.hidden_layers,
+                latent_dim_shared=self.latent_dim_shared, latent_dim_specific=self.latent_dim_specific,
+                dropout_rate=self.dropout_rate, beta=self.beta, gamma=self.gamma, lambda_adv=self.lambda_adv,
+                feat_mask=self.feat_mask, distribution=self.distribution,
+                encoder_covariates=encoder_covariates,
+                latent_backend=latent_backend,
+                lambda_prior_diff=lambda_prior_diff,
+                diffusion_steps=diffusion_steps,
+                diffusion_hidden_dim=diffusion_hidden_dim,
+                diffusion_time_embed_dim=diffusion_time_embed_dim,
+                diffusion_beta_schedule=diffusion_beta_schedule,
+                diffusion_prior_cond=diffusion_prior_cond,
+                beta_specific=beta_specific,
+            ).to(self.device)
+        elif self.model_architecture == "xattn":
+            self.model = EmbeddingNetXAttn(
+                self.device, self.input_dim, self.modality_num, self.covariates_dim,
+                celltype_num=self.celltype_num, backbone_dims=self.hidden_layers,
+                token_dim=token_dim, num_shared_tokens=num_shared_tokens,
+                num_private_tokens=num_private_tokens, dropout_rate=self.dropout_rate,
+                encoder_covariates=encoder_covariates,
+                beta=self.beta, beta_specific=beta_specific, lambda_adv=self.lambda_adv,
+                lambda_diff_recon=lambda_diff_recon,
+                lambda_token_orth=lambda_token_orth,
+                lambda_private_cls=lambda_private_cls,
+                diff_hidden_dim=diff_hidden_dim, diff_steps=diff_steps,
+                diff_time_embed_dim=diffusion_time_embed_dim,
+                diff_beta_schedule=diffusion_beta_schedule,
+                xattn_depth=xattn_depth, xattn_heads=xattn_heads,
+                xattn_dim_head=xattn_dim_head,
+                num_shared_protos=num_shared_protos,
+                num_private_protos=num_private_protos,
+                feat_mask=self.feat_mask,
+                distribution=self.distribution,
+            ).to(self.device)
+        else:
+            raise ValueError("model_architecture must be 'standard' or 'xattn'")
         self.train_dataset = CombinedDataset(self.data,self.covariates,self.modality,self.mask, self.celltype)
 
         self.confidence_weighted = confidence_weighted
@@ -247,8 +300,21 @@ class Integration:
             orphan_sim_threshold=orphan_sim_threshold,
             orphan_margin_threshold=orphan_margin_threshold,
         )
+        self.xattn_train_params = dict(
+            adv_stop_frac=adv_stop_frac,
+            support_ema_eta=support_ema_eta,
+            support_threshold=support_threshold,
+            support_min_updates=support_min_updates,
+        )
+        self._linked_features_spec = linked_features
+        self.linked_feature_idx = None
 
-        # Linked features for MNN anchor loss
+    def _resolve_linked_feature_idx(self):
+        """Resolve linked features lazily so non-anchor runs stay quiet."""
+        if self.linked_feature_idx is not None:
+            return self.linked_feature_idx
+
+        linked_features = self._linked_features_spec
         if linked_features is not None:
             if isinstance(linked_features, torch.Tensor):
                 linked_list = linked_features.detach().cpu().tolist()
@@ -261,7 +327,7 @@ class Integration:
                 )
 
             if len(linked_list) == 0:
-                self.linked_feature_idx = torch.tensor([], dtype=torch.long)
+                linked_idx = torch.tensor([], dtype=torch.long)
             elif isinstance(linked_list[0], str):
                 var_names = self.adata.var_names.astype(str)
                 name_to_idx = {name: idx for idx, name in enumerate(var_names)}
@@ -272,8 +338,7 @@ class Integration:
                         f"Warning: {missing} linked feature names were not found in adata.var_names "
                         "and will be ignored."
                     )
-                mapped_idx = sorted(set(mapped_idx))
-                self.linked_feature_idx = torch.tensor(mapped_idx, dtype=torch.long)
+                linked_idx = torch.tensor(sorted(set(mapped_idx)), dtype=torch.long)
             else:
                 linked_arr = np.asarray(linked_list, dtype=np.int64)
                 valid = (linked_arr >= 0) & (linked_arr < self.data.shape[1])
@@ -283,16 +348,13 @@ class Integration:
                         f"Warning: {dropped} linked feature indices are out of range "
                         "and will be ignored."
                     )
-                linked_arr = np.unique(linked_arr[valid])
-                self.linked_feature_idx = torch.tensor(linked_arr, dtype=torch.long)
+                linked_idx = torch.tensor(np.unique(linked_arr[valid]), dtype=torch.long)
         else:
-            # Auto-compute: intersection of feat_mask across modalities
             linked_mask = self.feat_mask.prod(dim=0)
-            self.linked_feature_idx = torch.where(linked_mask > 0)[0]
-        if len(self.linked_feature_idx) > 0:
-            print(f"Linked features for MNN anchor: {len(self.linked_feature_idx)} features")
-        else:
-            print("Warning: No linked features found. Anchor loss will be disabled.")
+            linked_idx = torch.where(linked_mask > 0)[0]
+
+        self.linked_feature_idx = linked_idx
+        return self.linked_feature_idx
 
     def train(self,epoch_num = 200, batch_size = 64, lr = 1e-5, accumulation_steps = 1,
               adaptlr = False, valid_prop = 0.1, num_warmup = 0, early_stopping = True, patience = 10,
@@ -346,9 +408,11 @@ class Integration:
             valid_dataset = Data.Subset(self.train_dataset, valid_indices)
         else:
             train_dataset, valid_dataset = self.train_dataset, self.train_dataset
+            train_indices = np.arange(len(train_dataset))
         self.num_batch = len(train_dataset)//self.batch_size
         
         print("Training start!")
+        print(f"Model architecture: {self.model_architecture}")
         cw_kwargs = dict(
             confidence_weighted=self.confidence_weighted,
             cw_adv_ramp_epochs=cw_adv_ramp_epochs,
@@ -357,10 +421,18 @@ class Integration:
             gate_ramp_epochs=gate_ramp_epochs,
             **self.cw_params,
         )
+        xattn_kwargs = dict(**self.xattn_train_params)
+        linked_feature_idx = torch.tensor([], dtype=torch.long)
+        if lambda_anchor > 0 and anchor_space != "latent":
+            linked_feature_idx = self._resolve_linked_feature_idx()
+            if len(linked_feature_idx) > 0:
+                print(f"Linked features for MNN anchor: {len(linked_feature_idx)} features")
+            else:
+                print("Warning: No linked features found. Anchor loss will be disabled.")
         anchor_kwargs = dict(
-            lambda_anchor=lambda_anchor if (anchor_space == "latent" or len(self.linked_feature_idx) > 0) else 0.0,
+            lambda_anchor=lambda_anchor if (anchor_space == "latent" or len(linked_feature_idx) > 0) else 0.0,
             k_mnn=k_mnn,
-            linked_feature_idx=self.linked_feature_idx.to(self.device) if len(self.linked_feature_idx) > 0 else None,
+            linked_feature_idx=linked_feature_idx.to(self.device) if len(linked_feature_idx) > 0 else None,
             anchor_space=anchor_space,
             anchor_start_epoch=anchor_start_epoch,
             anchor_ramp_epochs=anchor_ramp_epochs,
@@ -379,6 +451,13 @@ class Integration:
                 f"base_ratio={self.cw_params['lambda_adv_base_ratio']:.3f}, "
                 f"rho_target={self.cw_params['rho_target']:.3f}"
             )
+        if self.model_architecture == "xattn":
+            print(
+                "XAttn support config: "
+                f"adv_stop_frac={self.xattn_train_params['adv_stop_frac']:.3f}, "
+                f"support_threshold={self.xattn_train_params['support_threshold']:.3f}, "
+                f"support_min_updates={self.xattn_train_params['support_min_updates']}"
+            )
         if weighted:
             weights = 1.0 / np.bincount(self.modality.argmax(-1))
             sample_weights = weights[self.modality.argmax(-1)]
@@ -388,14 +467,14 @@ class Integration:
                         self.num_batch, self.lr, accumulation_steps=self.accumulation_steps,
                         adaptlr=self.adaptlr, num_warmup=num_warmup, early_stopping=early_stopping,
                         patience=patience, sample_weights=sample_weights,
-                        **cw_kwargs, **anchor_kwargs)
+                        **cw_kwargs, **xattn_kwargs, **anchor_kwargs)
         else:
             train_model(self.device, self.writer, train_dataset, valid_dataset,
                         self.model, self.epoch_num, self.batch_size,
                         self.num_batch, self.lr, accumulation_steps = self.accumulation_steps,
                         adaptlr = self.adaptlr, num_warmup = num_warmup, early_stopping = early_stopping,
                         patience = patience,
-                        **cw_kwargs, **anchor_kwargs)
+                        **cw_kwargs, **xattn_kwargs, **anchor_kwargs)
         if tensorboard:
             self.writer.close()
         print("Training finished!")

@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+import numpy as np
 
 
 class ConfidenceWeighter:
@@ -431,3 +432,65 @@ class RobustAdvGate:
             "mean_weight_by_modality": mean_weight_by_modality,
             "orphan_ratio_by_modality": orphan_ratio_by_modality,
         }
+
+
+class SupportTracker:
+    """Per-cell cross-modal support EMA via an epoch-level memory bank."""
+
+    def __init__(self, num_cells, num_modalities, device,
+                 eta=0.9, threshold=0.15, min_updates=5):
+        self.num_cells = num_cells
+        self.num_modalities = num_modalities
+        self.device = device
+        self.eta = eta
+        self.threshold = threshold
+        self.min_updates = min_updates
+
+        self.support_ema = torch.zeros(num_cells, device=device)
+        self.update_count = torch.zeros(num_cells, device=device)
+
+    @torch.no_grad()
+    def epoch_update(self, mu_shared_all, modality_labels_all, cell_indices=None):
+        """Update support EMA from a full-epoch memory bank."""
+        if mu_shared_all.numel() == 0:
+            return
+
+        z_norm = F.normalize(mu_shared_all.detach(), dim=1)
+        modality_labels_all = modality_labels_all.long().to(z_norm.device)
+        n_cells = z_norm.shape[0]
+        top1_sim = torch.zeros(n_cells, device=z_norm.device)
+
+        for mod_idx in range(self.num_modalities):
+            mask = modality_labels_all == mod_idx
+            if mask.sum() == 0:
+                continue
+
+            other_mask = ~mask
+            if other_mask.sum() == 0:
+                continue
+
+            z_mod = z_norm[mask]
+            z_other = z_norm[other_mask]
+            sim = z_mod @ z_other.t()
+            top1_sim[mask] = sim.max(dim=1).values
+
+        if cell_indices is None:
+            target_idx = torch.arange(n_cells, device=z_norm.device, dtype=torch.long)
+        else:
+            target_idx = cell_indices.to(z_norm.device).long()
+
+        first = self.update_count[target_idx] == 0
+        prev = self.support_ema[target_idx]
+        self.support_ema[target_idx] = torch.where(
+            first,
+            top1_sim,
+            self.eta * prev + (1.0 - self.eta) * top1_sim,
+        )
+        self.update_count[target_idx] += 1
+
+    def get_unsupported_mask(self, cell_indices):
+        """Return a bool mask where True means hand off from GAN to QKV."""
+        idx = cell_indices.long().to(self.support_ema.device)
+        ema = self.support_ema[idx]
+        enough = self.update_count[idx] >= self.min_updates
+        return (ema < self.threshold) & enough

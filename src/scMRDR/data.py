@@ -1,11 +1,4 @@
 import torch
-import numpy as np
-import pandas as pd
-import torch.utils.data as Data
-# from sklearn.model_selection import train_test_split
-# from sklearn.preprocessing import StandardScaler
-import torch.nn.functional as F
-import torch
 from torch.utils.data import Dataset
 
 class CombinedDataset(Dataset):
@@ -47,4 +40,4 @@ class CombinedDataset(Dataset):
         i_sample = self.i[index]
         w_sample = self.w[index]
 
-        return x_sample, b_sample, m_sample, i_sample, w_sample
+        return x_sample, b_sample, m_sample, i_sample, w_sample, index

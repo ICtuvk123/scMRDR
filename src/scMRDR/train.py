@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 from torch import optim
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 import numpy as np
 import os
 from .anchor import find_mnn_pairs, find_mnn_pairs_latent, anchor_loss
@@ -17,11 +18,11 @@ def _dataloader_kwargs(device):
     Build robust DataLoader runtime kwargs.
 
     Env overrides:
-      SCMRDR_NUM_WORKERS: int, default 2
+      SCMRDR_NUM_WORKERS: int, default 0
       SCMRDR_PIN_MEMORY: 0/1, default 1 on CUDA, 0 on CPU
       SCMRDR_PERSISTENT_WORKERS: 0/1, default 1 when num_workers > 0
     """
-    num_workers = int(os.getenv("SCMRDR_NUM_WORKERS", "2"))
+    num_workers = int(os.getenv("SCMRDR_NUM_WORKERS", "0"))
     pin_default = 1 if str(device).startswith("cuda") else 0
     pin_memory = int(os.getenv("SCMRDR_PIN_MEMORY", str(pin_default))) == 1
     persistent_default = 1 if num_workers > 0 else 0
@@ -34,6 +35,58 @@ def _dataloader_kwargs(device):
     if num_workers > 0:
         kwargs["persistent_workers"] = persistent_workers
     return kwargs
+
+
+def _unpack_batch(batch):
+    if len(batch) == 6:
+        return batch
+    if len(batch) == 5:
+        X, b, m, i, w = batch
+        idx = torch.arange(X.shape[0], dtype=torch.long)
+        return X, b, m, i, w, idx
+    raise ValueError(f"Unexpected batch structure of length {len(batch)}")
+
+
+def _uses_xattn_backend(model):
+    return hasattr(model, "token_encoder") and hasattr(model, "query_policy")
+
+
+@torch.no_grad()
+def _collect_support_memory(device, dataset, model, batch_size):
+    loader_kwargs = _dataloader_kwargs(device)
+    data = DataLoader(
+        dataset,
+        batch_size,
+        shuffle=False,
+        drop_last=False,
+        **loader_kwargs,
+    )
+
+    mu_shared_all = []
+    modality_labels_all = []
+    cell_indices_all = []
+    xattn_backend = _uses_xattn_backend(model)
+    stage = "warmup" if xattn_backend else "vae"
+
+    model.eval()
+    for batch in data:
+        X, b, m, i, w, idx = _unpack_batch(batch)
+        X, b, m, i, w = X.to(device), b.to(device), m.to(device), i.to(device), w.to(device)
+        idx = idx.to(device)
+
+        if xattn_backend and hasattr(model, "encode_shared_summary"):
+            mu_shared = model.encode_shared_summary(X, b, m, w, deterministic=True)
+        else:
+            mu_shared, _, _, _ = model(X, b, m, i, w, stage=stage)
+        mu_shared_all.append(mu_shared.detach())
+        modality_labels_all.append(torch.argmax(m, dim=1))
+        cell_indices_all.append(idx.long())
+
+    return (
+        torch.cat(mu_shared_all, dim=0),
+        torch.cat(modality_labels_all, dim=0),
+        torch.cat(cell_indices_all, dim=0),
+    )
 
 class EarlyStopping:
     '''
@@ -88,6 +141,9 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 lambda_adv_base_ratio=0.35, rho_target=0.65,
                 w_orphan_min=0.45, rarity_boost=0.10,
                 orphan_sim_threshold=0.15, orphan_margin_threshold=0.02,
+                adv_stop_frac=0.25,
+                support_ema_eta=0.9, support_threshold=0.15,
+                support_min_updates=5,
                 lambda_anchor=0.0, k_mnn=30, linked_feature_idx=None,
                 anchor_space="latent", anchor_start_epoch=0,
                 anchor_ramp_epochs=0, anchor_sim_threshold=0.0,
@@ -161,41 +217,61 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         early_stopping = EarlyStopping(patience=patience, verbose=True)
 
     # Confidence-weighted adversarial training setup
+    xattn_backend = _uses_xattn_backend(model)
     cw = None
     if confidence_weighted:
-        from .confidence import ConfidenceWeighter, RobustAdvGate
-        if gate_mode == "legacy":
-            cw = ConfidenceWeighter(
-                latent_dim=model.latent_dim_shared,
-                num_modalities=model.modality_num,
-                device=device,
-                queue_size=cw_queue_size, alpha=cw_alpha,
-                c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
-                tau_fallback=cw_tau_fallback, eta=cw_eta,
-                rho=cw_rho, tau_w=cw_tau_w, w_min=cw_w_min,
-                min_count=cw_min_count,
-            )
-        elif gate_mode == "robust_adv":
-            cw = RobustAdvGate(
-                latent_dim=model.latent_dim_shared,
-                num_modalities=model.modality_num,
-                device=device,
-                queue_size=cw_queue_size, alpha=cw_alpha,
-                c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
-                tau_fallback=cw_tau_fallback, eta=cw_eta,
-                tau_w=cw_tau_w, min_count=cw_min_count,
-                rho_target=rho_target, w_floor=cw_w_min,
-                w_orphan_min=w_orphan_min, rarity_boost=rarity_boost,
-                orphan_sim_threshold=orphan_sim_threshold,
-                orphan_margin_threshold=orphan_margin_threshold,
-            )
+        if xattn_backend:
+            print("Warning: confidence_weighted is ignored for model_architecture='xattn'.")
+            confidence_weighted = False
         else:
-            raise ValueError(f"Unsupported gate_mode: {gate_mode}")
-        lambda_target = cw_lambda_target if cw_lambda_target is not None else model.lambda_adv
-        T_w = num_warmup
-        T_r = cw_adv_ramp_epochs
-        if gate_start_epoch is None:
-            gate_start_epoch = num_warmup
+            from .confidence import ConfidenceWeighter, RobustAdvGate
+            if gate_mode == "legacy":
+                cw = ConfidenceWeighter(
+                    latent_dim=model.latent_dim_shared,
+                    num_modalities=model.modality_num,
+                    device=device,
+                    queue_size=cw_queue_size, alpha=cw_alpha,
+                    c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
+                    tau_fallback=cw_tau_fallback, eta=cw_eta,
+                    rho=cw_rho, tau_w=cw_tau_w, w_min=cw_w_min,
+                    min_count=cw_min_count,
+                )
+            elif gate_mode == "robust_adv":
+                cw = RobustAdvGate(
+                    latent_dim=model.latent_dim_shared,
+                    num_modalities=model.modality_num,
+                    device=device,
+                    queue_size=cw_queue_size, alpha=cw_alpha,
+                    c_tau=cw_c_tau, tau_min=cw_tau_min, tau_max=cw_tau_max,
+                    tau_fallback=cw_tau_fallback, eta=cw_eta,
+                    tau_w=cw_tau_w, min_count=cw_min_count,
+                    rho_target=rho_target, w_floor=cw_w_min,
+                    w_orphan_min=w_orphan_min, rarity_boost=rarity_boost,
+                    orphan_sim_threshold=orphan_sim_threshold,
+                    orphan_margin_threshold=orphan_margin_threshold,
+                )
+            else:
+                raise ValueError(f"Unsupported gate_mode: {gate_mode}")
+            lambda_target = cw_lambda_target if cw_lambda_target is not None else model.lambda_adv
+            T_w = num_warmup
+            T_r = cw_adv_ramp_epochs
+            if gate_start_epoch is None:
+                gate_start_epoch = num_warmup
+
+    support_tracker = None
+    adv_stop_epoch = max(num_warmup, int(adv_stop_frac * epoch_num))
+    if xattn_backend:
+        from .confidence import SupportTracker
+
+        base_dataset = train_dataset.dataset if isinstance(train_dataset, Subset) else train_dataset
+        support_tracker = SupportTracker(
+            num_cells=len(base_dataset),
+            num_modalities=model.modality_num,
+            device=device,
+            eta=support_ema_eta,
+            threshold=support_threshold,
+            min_updates=support_min_updates,
+        )
 
     for epoch in range(epoch_num):
         # Anchor ramp: Phase A (no anchor) -> Phase B (ramp up)
@@ -211,8 +287,10 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
         model.train()
         total_loss,recon_loss,kl_z,preserve_loss,adv_loss,total_discri_loss,total_anchor_loss = \
             0,0,0,0,0,0,0
-        for step, (X,b,m,i,w) in enumerate(train_data):
-            X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
+        for step, batch in enumerate(train_data):
+            X, b, m, i, w, cell_idx = _unpack_batch(batch)
+            X, b, m, i, w = X.to(device), b.to(device), m.to(device), i.to(device), w.to(device)
+            cell_idx = cell_idx.to(device)
             X.requires_grad = True
             b.requires_grad = True
             m.requires_grad = True
@@ -277,7 +355,13 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 ### === Phase A: Train Discriminator === ###
                 model.eval()
                 model.discriminator.train()
-                discri_loss = model(X,b,m,i,w, stage="discriminator")
+                if xattn_backend and epoch >= adv_stop_epoch and support_tracker is not None:
+                    unsupported_disc = support_tracker.get_unsupported_mask(cell_idx)
+                    supported_disc = ~unsupported_disc
+                    discri_loss = model(X, b, m, i, w, stage="discriminator", adv_mask=supported_disc)
+                else:
+                    supported_disc = torch.ones(m.shape[0], dtype=torch.bool, device=device)
+                    discri_loss = model(X,b,m,i,w, stage="discriminator")
                 # with torch.autograd.detect_anomaly():
                 discri_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1) 
@@ -406,6 +490,71 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                                 global_step,
                             )
                         writer.add_scalar("anchor_Loss/train", a_loss_val, global_step)
+                elif xattn_backend:
+                    mu_shared, _, base_loss, loss_dict = model(
+                        X, b, m, i, w, stage="vae", return_adv_components=True
+                    )
+                    modality_labels_batch = torch.argmax(m, dim=1)
+
+                    if epoch >= adv_stop_epoch and support_tracker is not None:
+                        stop_mask = support_tracker.get_unsupported_mask(cell_idx)
+                        mu_for_adv = torch.where(
+                            stop_mask.unsqueeze(1),
+                            mu_shared.detach(),
+                            mu_shared,
+                        )
+                    else:
+                        stop_mask = torch.zeros_like(modality_labels_batch, dtype=torch.bool)
+                        mu_for_adv = mu_shared
+
+                    adv_logits = model.discriminator(mu_for_adv)
+                    adv_loss_scalar = -F.cross_entropy(
+                        adv_logits, modality_labels_batch, reduction="sum"
+                    ) / m.shape[0]
+                    loss = base_loss + model.lambda_adv * adv_loss_scalar
+
+                    a_loss_val = 0.0
+                    if lambda_anchor_current > 0:
+                        if anchor_space == "latent":
+                            mnn_i, mnn_j = find_mnn_pairs_latent(
+                                mu_shared, modality_labels_batch, k=k_mnn,
+                                sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                            )
+                        else:
+                            mnn_i, mnn_j = find_mnn_pairs(
+                                X, modality_labels_batch, model.feat_mask, k=k_mnn,
+                                linked_feature_idx=linked_feature_idx,
+                                sim_threshold=anchor_sim_threshold, margin=anchor_margin,
+                            )
+                        a_loss = anchor_loss(mu_shared, mnn_i, mnn_j)
+                        loss = loss + lambda_anchor_current * a_loss
+                        a_loss_val = a_loss.item()
+
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+                    if (step + 1) % accumulation_steps == 0:
+                        optimizer_vae.step()
+                        optimizer_vae.zero_grad()
+
+                    total_loss += loss.item()
+                    recon_loss += loss_dict['recon_loss']
+                    kl_z += loss_dict['kl_z']
+                    preserve_loss += loss_dict['preserve_loss']
+                    adv_loss += adv_loss_scalar.item()
+                    total_discri_loss += discri_loss.item()
+                    total_anchor_loss += a_loss_val
+
+                    if writer is not None:
+                        global_step = epoch * num_batch + step + 1
+                        writer.add_scalar("Loss/train", loss.item(), global_step)
+                        writer.add_scalar("recon_Loss/train", loss_dict['recon_loss'], global_step)
+                        writer.add_scalar("KLz_Loss/train", loss_dict['kl_z'], global_step)
+                        writer.add_scalar("preserve_Loss/train", loss_dict['preserve_loss'], global_step)
+                        writer.add_scalar("adv_Loss/train", adv_loss_scalar.item(), global_step)
+                        writer.add_scalar("discri_Loss/train", discri_loss.item(), global_step)
+                        writer.add_scalar("anchor_Loss/train", a_loss_val, global_step)
+                        writer.add_scalar("unsupported_ratio/train", stop_mask.float().mean().item(), global_step)
+                        writer.add_scalar("supported_ratio_discriminator/train", supported_disc.float().mean().item(), global_step)
                 else:
                     # Original adversarial training (no confidence weighting)
                     mu_shared, _, loss, loss_dict = model(X,b,m,i,w,stage="vae")
@@ -457,6 +606,27 @@ def train_model(device, writer, train_dataset, validate_dataset, model, epoch_nu
                 if adaptlr == True:
                     scheduler_vae.step()
             
+        if support_tracker is not None and epoch >= num_warmup:
+            mu_support, modality_support, idx_support = _collect_support_memory(
+                device, train_dataset, model, batch_size
+            )
+            support_tracker.epoch_update(mu_support, modality_support, idx_support)
+
+            if writer is not None:
+                tracked = support_tracker.update_count[idx_support] >= support_tracker.min_updates
+                if tracked.any():
+                    unsupported = support_tracker.get_unsupported_mask(idx_support)
+                    writer.add_scalar(
+                        "unsupported_ratio_epoch/train",
+                        unsupported.float().mean().item(),
+                        epoch + 1,
+                    )
+                    writer.add_scalar(
+                        "support_ema_mean_epoch/train",
+                        support_tracker.support_ema[idx_support].mean().item(),
+                        epoch + 1,
+                    )
+
         if writer is not None:
             writer.add_scalar("Loss_epoch/train", total_loss / num_batch, epoch+1)
             writer.add_scalar("recon_Loss_epoch/train", recon_loss / num_batch, epoch+1)
@@ -498,7 +668,8 @@ def validate_model(device, validate_dataset, model, batch_size):
     )
     total_loss= 0
     with torch.no_grad():
-        for _, (X,b,m,i,w) in enumerate(validate_data):
+        for _, batch in enumerate(validate_data):
+            X, b, m, i, w, _ = _unpack_batch(batch)
             X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
             _,_,loss,_ = model(X,b,m,i,w,stage="vae")
             total_loss += loss.item()
@@ -527,7 +698,8 @@ def inference_model(device, inference_dataset, model, batch_size):
     z2_list = []
     total_loss,recon_loss,kl_z,preserve_loss,adv_loss= \
             0,0,0,0,0
-    for step, (X,b,m,i,w) in enumerate(inference_data):
+    for step, batch in enumerate(inference_data):
+        X, b, m, i, w, _ = _unpack_batch(batch)
         X,b,m,i,w = X.to(device),b.to(device),m.to(device), i.to(device),w.to(device)
         z1,z2,loss,loss_dict = model(X,b,m,i,w,stage="vae")
         z1_list.append(z1.detach().cpu().numpy())

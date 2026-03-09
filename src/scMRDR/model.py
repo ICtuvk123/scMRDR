@@ -1,14 +1,13 @@
 import torch
 import numpy as np
 import torch.nn as nn
-import matplotlib.pyplot as plt
 import warnings
 # import torchvision.transforms as transforms
 from .loss import *
-from .diffusion import GaussianDiffusion1D, LatentDenoiserMLP
+from .diffusion import GaussianDiffusion1D, LatentDenoiserMLP, SinusoidalTimeEmbedding
+from .token_encoder import TokenEncoder, GlobalQueryPolicy
+from .diffusion_decoder import ExpressionDiffusion
 from torch.nn import functional as F
-import scipy as sp
-import ot
 
 class ModalityDiscriminator(nn.Module):
     '''
@@ -710,4 +709,317 @@ class EmbeddingNet(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    
+
+class EmbeddingNetXAttn(nn.Module):
+    """Diffusion cross-attention model for rare-cell-aware integration.
+
+    Replaces the hard shared/private encoder split with:
+    - TokenEncoder: shared + private semantic tokens via reparameterized heads
+    - GlobalQueryPolicy: per-cell query biases with timestep FiLM
+    - ExpressionDiffusion: dual-path cross-attention decoder with L1 x_0 loss
+    - Discriminator on mu_shared (mean of shared tokens)
+    - Private classifier on mu_specific (narrowing regularizer)
+
+    Existing EmbeddingNet is completely untouched.
+    """
+
+    def __init__(self, device, input_dim, modality_num, covariate_dim=0,
+                 celltype_num=0, backbone_dims=(500, 100),
+                 token_dim=32, num_shared_tokens=4, num_private_tokens=2,
+                 dropout_rate=0.5, encoder_covariates=False,
+                 beta=2.0, beta_specific=None, lambda_adv=0.01,
+                 lambda_diff_recon=1.0, lambda_token_orth=0.0,
+                 lambda_private_cls=0.03,
+                 diff_hidden_dim=256, diff_steps=100,
+                 diff_time_embed_dim=64, diff_beta_schedule="linear",
+                 xattn_depth=2, xattn_heads=4, xattn_dim_head=32,
+                 num_shared_protos=2, num_private_protos=2,
+                 gate_hidden=64,
+                 feat_mask=None, eps=1e-10, distribution="ZINB"):
+        super().__init__()
+
+        self.device = device
+        self.input_dim = input_dim
+        self.modality_num = modality_num
+        self.covariate_dim = covariate_dim
+        self.celltype_num = celltype_num
+        self.token_dim = token_dim
+        self.num_shared_tokens = num_shared_tokens
+        self.num_private_tokens = num_private_tokens
+        self.beta = beta
+        self.beta_specific = beta_specific if beta_specific is not None else beta
+        self.lambda_adv = lambda_adv
+        self.lambda_diff_recon = lambda_diff_recon
+        self.lambda_token_orth = lambda_token_orth
+        self.lambda_private_cls = lambda_private_cls
+        self.eps = eps
+        self.encoder_covariates = encoder_covariates
+        self.distribution = distribution
+
+        if self.distribution not in {"ZINB", "NB"}:
+            raise ValueError(
+                "EmbeddingNetXAttn V1 only supports count-style distributions "
+                "compatible with log1p inputs: {'ZINB', 'NB'}."
+            )
+
+        if feat_mask is not None:
+            self.feat_mask = feat_mask.to(device)
+        else:
+            self.feat_mask = None
+
+        # Token encoder
+        self.token_encoder = TokenEncoder(
+            input_dim=input_dim,
+            modality_num=modality_num,
+            covariate_dim=covariate_dim,
+            celltype_num=celltype_num,
+            backbone_dims=backbone_dims,
+            token_dim=token_dim,
+            num_shared_tokens=num_shared_tokens,
+            num_private_tokens=num_private_tokens,
+            dropout_rate=dropout_rate,
+            encoder_covariates=encoder_covariates,
+        )
+
+        # Inner dim for cross-attention query projections
+        inner_dim = xattn_heads * xattn_dim_head
+
+        # Global query policy
+        self.query_policy = GlobalQueryPolicy(
+            num_shared_protos=num_shared_protos,
+            num_private_protos=num_private_protos,
+            inner_dim=inner_dim,
+            backbone_dim=backbone_dims[-1],
+            time_embed_dim=diff_time_embed_dim,
+            gate_hidden=gate_hidden,
+        )
+
+        # Time embedding (shared with query policy)
+        self.time_embed = SinusoidalTimeEmbedding(diff_time_embed_dim)
+
+        # Expression diffusion with dual-path decoder
+        self.expression_diffusion = ExpressionDiffusion(
+            input_dim=input_dim,
+            token_dim=token_dim,
+            hidden_dim=diff_hidden_dim,
+            time_embed_dim=diff_time_embed_dim,
+            xattn_depth=xattn_depth,
+            xattn_heads=xattn_heads,
+            xattn_dim_head=xattn_dim_head,
+            dropout=dropout_rate,
+            diff_steps=diff_steps,
+            beta_schedule=diff_beta_schedule,
+        )
+
+        # Discriminator on mu_shared (mean of shared tokens)
+        # latent_dim_shared for compatibility with existing training code
+        self.latent_dim_shared = token_dim
+        self.discriminator = ModalityDiscriminator(
+            z_dim=token_dim,
+            num_modalities=modality_num,
+            layer_dims=list(backbone_dims),
+            dropout_rate=dropout_rate,
+        )
+
+        # Private classifier (narrowing regularizer)
+        self.private_classifier = nn.Linear(token_dim, modality_num)
+
+    def _build_observed_mask(self, i):
+        if self.feat_mask is None:
+            return None
+        return i @ self.feat_mask
+
+    def encode_shared_summary(self, x, b, m, w, deterministic=False):
+        """Return pooled shared representation for downstream support/discriminator use."""
+        x_log = torch.log1p(x)
+        token_out = self.token_encoder(x_log, m, b, w, sample=not deterministic)
+        if deterministic:
+            return token_out["shared_mu_tokens"].mean(dim=1)
+        return token_out["shared_tokens"].mean(dim=1)
+
+    def vae_parameters(self):
+        """All parameters except the discriminator."""
+        modules = [
+            self.token_encoder,
+            self.query_policy,
+            self.time_embed,
+            self.expression_diffusion,
+            self.private_classifier,
+        ]
+        for module in modules:
+            yield from module.parameters()
+
+    def forward(self, x, b, m, i, w, stage="vae", return_adv_components=False, adv_mask=None):
+        """
+        Args:
+            x: (B, input_dim) raw counts or expression
+            b: (B, covariate_dim) batch info
+            m: (B, modality_num) one-hot modality
+            i: (B, input_dim) or (B, mask_num) mask indicator
+            w: (B, celltype_num) cell type info
+            stage: "vae", "discriminator", or "warmup"
+            return_adv_components: if True, return per-sample adv for gated training
+        Returns:
+            For "vae"/"warmup": (mu_shared, mu_specific, loss, loss_dict)
+            For "discriminator": discri_loss scalar
+        """
+        if stage == "discriminator":
+            return self._forward_discriminator(x, b, m, w, adv_mask=adv_mask)
+
+        # --- Encode ---
+        x_log = torch.log1p(x)
+
+        token_out = self.token_encoder(x_log, m, b, w, sample=True)
+        shared_tokens = token_out["shared_tokens"]     # (B, K_s, d)
+        private_tokens = token_out["private_tokens"]    # (B, K_p, d)
+        backbone_h = token_out["backbone_h"]            # (B, bb_dim)
+
+        # Summary latents (for discriminator / downstream)
+        mu_shared = shared_tokens.mean(dim=1)           # (B, d)
+        mu_specific = private_tokens.mean(dim=1)        # (B, d)
+
+        obs_mask = self._build_observed_mask(i)
+
+        # --- Diffusion reconstruction with dual-path attention ---
+        B = x.shape[0]
+        t = self.expression_diffusion.diffusion.sample_timesteps(B, x.device)
+        t_emb_raw = self.time_embed(t)                  # (B, time_embed_dim)
+
+        q_bias_shared, q_bias_private, alpha_s, alpha_p = \
+            self.query_policy(backbone_h, t_emb_raw)
+
+        diff_recon_loss = self.expression_diffusion.training_loss(
+            x_log, shared_tokens, private_tokens,
+            q_bias_shared, q_bias_private, t=t, mask=obs_mask, eps=self.eps,
+        )
+
+        # --- KL losses ---
+        kl_shared = klLoss(
+            token_out["shared_mu"],
+            token_out["shared_logvar"],
+        )
+        kl_specific = klLoss(
+            token_out["private_mu"],
+            token_out["private_logvar"],
+        )
+        kl_z = kl_shared + kl_specific
+
+        # --- Token orthogonality ---
+        if self.lambda_token_orth > 0:
+            tok_orth = token_orthogonality_loss(shared_tokens, private_tokens)
+        else:
+            tok_orth = torch.tensor(0.0, device=x.device)
+
+        # --- Private classifier (narrowing regularizer) ---
+        modality_labels = torch.argmax(m, dim=1)
+        private_cls_loss = private_semantic_loss(
+            self.private_classifier(mu_specific),
+            modality_labels,
+        )
+
+        # --- Adversarial loss ---
+        if stage == "warmup":
+            adv_loss = torch.tensor(0.0, device=x.device)
+            total_loss = (
+                self.lambda_diff_recon * diff_recon_loss
+                + self.beta * kl_shared
+                + self.beta_specific * kl_specific
+                + self.lambda_token_orth * tok_orth
+                + self.lambda_private_cls * private_cls_loss
+            )
+            loss_dict = {
+                "total_loss": total_loss.item(),
+                "recon_loss": diff_recon_loss.item(),
+                "kl_z": kl_z.item(),
+                "kl_specific": kl_specific.item(),
+                "kl_shared": kl_shared.item(),
+                "preserve_loss": 0.0,
+                "adv_loss": 0.0,
+                "private_cls": private_cls_loss.item(),
+                "token_orth": tok_orth.item(),
+                "prior_diff_loss": 0.0,
+                "diff_loss": 0.0,
+                "_z_shared": mu_shared,
+            }
+            return mu_shared, mu_specific, total_loss, loss_dict
+
+        # stage == "vae"
+        modality_logits_adv = self.discriminator(mu_shared)
+
+        if return_adv_components:
+            per_sample_adv = -F.cross_entropy(
+                modality_logits_adv, modality_labels, reduction="none"
+            )
+            adv_loss_scalar = per_sample_adv.sum() / B
+
+            base_loss = (
+                self.lambda_diff_recon * diff_recon_loss
+                + self.beta * kl_shared
+                + self.beta_specific * kl_specific
+                + self.lambda_token_orth * tok_orth
+                + self.lambda_private_cls * private_cls_loss
+            )
+
+            loss_dict = {
+                "total_loss": (base_loss + self.lambda_adv * adv_loss_scalar).item(),
+                "recon_loss": diff_recon_loss.item(),
+                "kl_z": kl_z.item(),
+                "kl_specific": kl_specific.item(),
+                "kl_shared": kl_shared.item(),
+                "preserve_loss": 0.0,
+                "adv_loss": adv_loss_scalar.item(),
+                "private_cls": private_cls_loss.item(),
+                "token_orth": tok_orth.item(),
+                "prior_diff_loss": 0.0,
+                "diff_loss": 0.0,
+                "_z_shared": mu_shared,
+                "_modality_logits": modality_logits_adv,
+                "_per_sample_adv": per_sample_adv,
+            }
+            return mu_shared, mu_specific, base_loss, loss_dict
+        else:
+            adv_loss = -F.cross_entropy(
+                modality_logits_adv, modality_labels, reduction="sum"
+            ) / B
+
+            total_loss = (
+                self.lambda_diff_recon * diff_recon_loss
+                + self.beta * kl_shared
+                + self.beta_specific * kl_specific
+                + self.lambda_adv * adv_loss
+                + self.lambda_token_orth * tok_orth
+                + self.lambda_private_cls * private_cls_loss
+            )
+
+            loss_dict = {
+                "total_loss": total_loss.item(),
+                "recon_loss": diff_recon_loss.item(),
+                "kl_z": kl_z.item(),
+                "kl_specific": kl_specific.item(),
+                "kl_shared": kl_shared.item(),
+                "preserve_loss": 0.0,
+                "adv_loss": adv_loss.item(),
+                "private_cls": private_cls_loss.item(),
+                "token_orth": tok_orth.item(),
+                "prior_diff_loss": 0.0,
+                "diff_loss": 0.0,
+            }
+            return mu_shared, mu_specific, total_loss, loss_dict
+
+    def _forward_discriminator(self, x, b, m, w, adv_mask=None):
+        """Train discriminator only (frozen VAE)."""
+        if adv_mask is not None:
+            adv_mask = adv_mask.bool()
+            if adv_mask.sum() == 0:
+                return next(self.discriminator.parameters()).sum() * 0.0
+            x = x[adv_mask]
+            b = b[adv_mask]
+            m = m[adv_mask]
+            w = w[adv_mask]
+
+        with torch.no_grad():
+            mu_shared = self.encode_shared_summary(x, b, m, w, deterministic=False)
+
+        modality_labels = torch.argmax(m, dim=1)
+        logits = self.discriminator(mu_shared.detach())
+        return F.cross_entropy(logits, modality_labels, reduction="sum") / m.shape[0]

@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.nn import functional as F
-import numpy as np
-from sklearn.neighbors import kneighbors_graph
 
 class ZINBLoss(nn.Module):
     """
@@ -142,3 +139,26 @@ def isometric_loss(X, X_prime, m, p=2):
     loss = F.mse_loss(D_X_prime, D_X, reduction='sum') / X.shape[0] # Element-wise masking
     return loss
 
+
+def token_orthogonality_loss(shared_tokens, private_tokens):
+    """Encourage orthogonality between shared and private token groups.
+
+    Args:
+        shared_tokens:  (B, K_s, d) shared semantic tokens
+        private_tokens: (B, K_p, d) private semantic tokens
+
+    Returns:
+        scalar: ||S^T @ P||_F^2 / (K_s * K_p), averaged over batch
+    """
+    # shared_tokens: (B, K_s, d), private_tokens: (B, K_p, d)
+    # cross_gram: (B, K_s, K_p) = S^T @ P per sample
+    cross_gram = torch.bmm(shared_tokens, private_tokens.transpose(1, 2))
+    loss = (cross_gram ** 2).sum(dim=(1, 2))  # (B,)
+    K_s = shared_tokens.shape[1]
+    K_p = private_tokens.shape[1]
+    return loss.mean() / (K_s * K_p)
+
+
+def private_semantic_loss(private_logits, modality_labels):
+    """Cross-entropy loss for the private semantic narrowing regularizer."""
+    return F.cross_entropy(private_logits, modality_labels)
